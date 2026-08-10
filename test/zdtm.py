@@ -1065,21 +1065,23 @@ class criu_rpc:
             elif "--mntns-compat-mode" == arg:
                 criu.opts.mntns_compat_mode = True
             elif arg in ("-c", "--compress"):
-                criu.opts.compress = 1  # COMPRESS_PER_PAGE
+                criu.opts.compress = 1  # COMPRESS_BLOCK
+                criu.opts.compress_block_size = mmap.PAGESIZE
             elif "--compress-acceleration" == arg:
                 criu.opts.compress_acceleration = int(args.pop(0))
                 if criu.opts.compress == 0:
                     criu.opts.compress = 1
-            elif arg == "--compress-region" or \
-                    arg.startswith("--compress-region="):
-                # Accept K/M/G suffixes and both '--compress-region SIZE'
-                # and '--compress-region=SIZE' forms.
+                    criu.opts.compress_block_size = mmap.PAGESIZE
+            elif arg == "--compress-block" or \
+                    arg.startswith("--compress-block="):
+                # Accept K/M/G suffixes and both '--compress-block SIZE'
+                # and '--compress-block=SIZE' forms.
                 if "=" in arg:
                     val = arg.split("=", 1)[1]
                 else:
                     val = args.pop(0)
-                criu.opts.compress_region_size = parse_size_str(val)
-                criu.opts.compress = 2  # COMPRESS_REGION
+                criu.opts.compress_block_size = parse_size_str(val)
+                criu.opts.compress = 1  # COMPRESS_BLOCK
             elif arg == "--decompress-threads" or \
                     arg.startswith("--decompress-threads="):
                 if "=" in arg:
@@ -1217,7 +1219,7 @@ class criu:
         self.__mntns_compat_mode = bool(opts['mntns_compat_mode'])
         self.__compress = bool(opts['compress'])
         self.__compress_acceleration = opts.get('compress_acceleration', 0)
-        self.__compress_region = opts.get('compress_region', None)
+        self.__compress_block = opts.get('compress_block', None)
         self.__cuda_checkpoint = bool(opts['mocked_cuda_checkpoint'])
 
         if opts['rpc']:
@@ -1447,9 +1449,11 @@ class criu:
                     offset = ((offset + mmap.PAGESIZE - 1) //
                               mmap.PAGESIZE * mmap.PAGESIZE)
 
-                compressed_sizes = entry.get("compressed_size", [])
-                if compressed_sizes:
-                    offset += sum(int(size) for size in compressed_sizes)
+                blocks = entry.get("blocks")
+                if blocks and blocks.get("block_sizes"):
+                    offset += int(blocks.get(
+                        "total_payload_size",
+                        sum(int(s) for s in blocks["block_sizes"])))
                 else:
                     offset += nr_pages * mmap.PAGESIZE
                 page_count += nr_pages
@@ -1510,16 +1514,16 @@ class criu:
 
         r_pages = real_written / mmap.PAGESIZE
         r_off = real_written % mmap.PAGESIZE
-        # Detect compression: from CLI (--compress / --compress-region)
+        # Detect compression: from CLI (--compress / --compress-block)
         # or from the test's dump options when -c / --compress /
-        # --compress-region is in .desc opts.
-        compress = (self.__compress or bool(self.__compress_region) or
+        # --compress-block is in .desc opts.
+        compress = (self.__compress or bool(self.__compress_block) or
                     bool(self.__compress_acceleration))
         if not compress and self.__test is not None:
             dopts = self.__test.getdopts()
             compress = ('-c' in dopts or
                         any(a == '--compress' or
-                            a.startswith('--compress-region')
+                            a.startswith('--compress-block')
                             for a in dopts))
         if compress:
             metadata_pages, metadata_bytes = self.__compressed_pages_layout()
@@ -1657,8 +1661,8 @@ class criu:
             a_opts += ["--pre-dump-mode", "%s" % self.__pre_dump_mode]
         if self.__compress:
             a_opts += ["-c"]
-        if self.__compress_region:
-            a_opts += ["--compress-region", str(self.__compress_region)]
+        if self.__compress_block:
+            a_opts += ["--compress-block", str(self.__compress_block)]
         if self.__compress_acceleration:
             a_opts += ["--compress-acceleration", "%d" % self.__compress_acceleration]
 
@@ -2351,7 +2355,7 @@ class Launcher:
               'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'stream',
               'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'image_io_mode', 'mntns_compat_mode',
               'rootless', 'preload_libfault', 'mocked_cuda_checkpoint',
-              'compress', 'compress_acceleration', 'compress_region',
+              'compress', 'compress_acceleration', 'compress_block',
               'pycriu_search_path')
         arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
@@ -3071,10 +3075,10 @@ def get_cli_args():
                     nargs='+',
                     default=None)
     rp.add_argument("--compress",
-                    help="Enable LZ4 per-page compression of memory pages",
+                    help="Enable LZ4 compression of memory pages",
                     action='store_true')
-    rp.add_argument("--compress-region",
-                    help="Enable LZ4 region compression with the given region "
+    rp.add_argument("--compress-block",
+                    help="Enable LZ4 block compression with the given block "
                          "size (K/M/G suffix accepted, e.g. 256K, 1M)",
                     default=None)
     rp.add_argument("--compress-acceleration",

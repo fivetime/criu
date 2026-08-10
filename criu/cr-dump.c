@@ -1707,9 +1707,9 @@ static int cr_pre_dump_finish(int status, const InventoryEntry *parent_ie)
 	he.has_compress = true;
 	he.compress = opts.compress_mode;
 
-	if (opts.compress_mode == COMPRESS_REGION && opts.compress_region_size) {
-		he.has_compress_region_size = true;
-		he.compress_region_size = opts.compress_region_size;
+	if (opts.compress_mode == COMPRESS_BLOCK && opts.compress_block_size) {
+		he.has_compress_block_size = true;
+		he.compress_block_size = opts.compress_block_size;
 	}
 
 	pstree_switch_state(root_item, TASK_ALIVE);

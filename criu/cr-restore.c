@@ -3422,8 +3422,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		unsigned int n;
 
 		for (n = 0; n < task_args->vma_ios_n; n++) {
-			if (rio->compressed_size)
-				RST_MEM_FIXUP_PPTR(rio->compressed_size);
+			if (rio->b_layout.sizes)
+				RST_MEM_FIXUP_PPTR(rio->b_layout.sizes);
 			if (rio->block_pages)
 				RST_MEM_FIXUP_PPTR(rio->block_pages);
 			rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));

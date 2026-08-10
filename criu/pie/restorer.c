@@ -1774,23 +1774,23 @@ static int validate_direct_vma_io(struct restore_vma_io *rio)
 
 	if (rio->storage != VMA_IO_PACKED_RAW && rio->storage != VMA_IO_ZERO)
 		return -1;
-	if (rio->n_compressed_size <= 0 || !rio->compressed_size) {
+	if (rio->b_layout.nr_blocks == 0 || !rio->b_layout.sizes) {
 		pr_err("Direct compressed VMA IO has no block metadata\n");
 		return -1;
 	}
-	if (rio->region_pages && !rio->block_pages) {
-		pr_err("Direct compressed region VMA IO has no page counts\n");
+	if (rio->b_layout.pages_per_block && !rio->block_pages) {
+		pr_err("Direct compressed block VMA IO has no page counts\n");
 		return -1;
 	}
 
-	for (i = 0; i < rio->n_compressed_size; i++) {
-		unsigned int block_pages = rio->region_pages ?
+	for (i = 0; i < rio->b_layout.nr_blocks; i++) {
+		unsigned int block_pages = rio->b_layout.pages_per_block ?
 						rio->block_pages[i] : 1;
 		uint64_t block_bytes;
-		uint32_t compressed_size = rio->compressed_size[i];
+		uint32_t compressed_size = rio->b_layout.sizes[i];
 
 		if (!block_pages ||
-		    (rio->region_pages && block_pages > rio->region_pages)) {
+		    (rio->b_layout.pages_per_block && block_pages > rio->b_layout.pages_per_block)) {
 			pr_err("Invalid direct VMA IO block page count %u\n",
 			       block_pages);
 			return -1;
@@ -1825,12 +1825,12 @@ static int validate_direct_vma_io(struct restore_vma_io *rio)
 		iov_bytes += rio->iovs[i].iov_len;
 	}
 
-	if (payload_bytes != rio->total_compressed_size ||
+	if (payload_bytes != rio->b_layout.total_bytes ||
 	    output_bytes != iov_bytes || rio->n_pages <= 0 ||
 	    output_bytes != (uint64_t)rio->n_pages * PAGE_SIZE) {
 		pr_err("Inconsistent direct VMA IO sizes: payload=%llu metadata=%llu output=%llu iov=%llu\n",
 		       (unsigned long long)payload_bytes,
-		       (unsigned long long)rio->total_compressed_size,
+		       (unsigned long long)rio->b_layout.total_bytes,
 		       (unsigned long long)output_bytes,
 		       (unsigned long long)iov_bytes);
 		return -1;

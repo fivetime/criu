@@ -166,7 +166,7 @@ int check_img_inventory(bool restore)
 		/* Validate the protobuf uint32 before narrowing it to the signed
 		 * command-line option field. Values above INT_MAX would otherwise
 		 * become negative and evade a signed upper-bound check. */
-		if (he->compress > COMPRESS_REGION) {
+		if (he->compress > COMPRESS_BLOCK) {
 			pr_err("Image has unknown compression mode %u\n", he->compress);
 			goto out_err;
 		}
@@ -175,9 +175,16 @@ int check_img_inventory(bool restore)
 			       he->img_version);
 			goto out_err;
 		}
-		opts.compress_mode = he->compress;
-		if (he->has_compress_region_size)
-			opts.compress_region_size = he->compress_region_size;
+		opts.compress_mode = he->compress ? COMPRESS_BLOCK : COMPRESS_OFF;
+		if (opts.compress_mode) {
+			if (he->has_compress_block_size && he->compress_block_size)
+				opts.compress_block_size = he->compress_block_size;
+			else if (!opts.compress_block_size)
+				opts.compress_block_size = PAGE_SIZE;
+		} else if (restore) {
+			opts.compress_acceleration = 0;
+			opts.compress_block_size = 0;
+		}
 
 		/*
 		 * On restore the compression mode usually comes from the
@@ -192,27 +199,25 @@ int check_img_inventory(bool restore)
 #else
 			/*
 			 * The image-streamer and page-server/remote restore
-			 * readers only understand the per-page wire format.
-			 * A region-compressed image must use the local
+			 * readers only understand page-sized blocks.
+			 * A multi-page block-compressed image must use the local
 			 * restore path.
 			 */
-			if (opts.compress_mode == COMPRESS_REGION) {
+			if (opts.compress_block_size > PAGE_SIZE) {
 				if (opts.stream) {
-					pr_err("Region-compressed image cannot be restored with --stream\n");
+					pr_err("Multi-page block compressed image cannot be restored with --stream\n");
 					goto out_err;
 				}
 				if (opts.use_page_server || opts.addr) {
-					pr_err("Region-compressed image cannot be restored via page-server\n");
+					pr_err("Multi-page block compressed image cannot be restored via page-server\n");
 					goto out_err;
 				}
 			}
 #endif
 		}
 
-		if (opts.compress_mode == COMPRESS_REGION)
-			pr_debug("Region decompression of memory pages is enabled\n");
-		else if (opts.compress_mode == COMPRESS_PER_PAGE)
-			pr_debug("Per-page decompression of memory pages is enabled\n");
+		if (opts.compress_mode)
+			pr_debug("Block decompression of memory pages is enabled\n");
 	} else if (restore) {
 		/*
 		 * Image without compression metadata (e.g. an older image).
@@ -221,7 +226,7 @@ int check_img_inventory(bool restore)
 		 */
 		opts.compress_mode = COMPRESS_OFF;
 		opts.compress_acceleration = 0;
-		opts.compress_region_size = 0;
+		opts.compress_block_size = 0;
 	}
 
 	ret = 0;
@@ -429,7 +434,7 @@ int get_parent_inventory(InventoryEntry **parent_ie)
 		pr_err("Unsupported parent image version %u\n", ie->img_version);
 		goto err;
 	}
-	if (ie->has_compress && ie->compress > COMPRESS_REGION) {
+	if (ie->has_compress && ie->compress > COMPRESS_BLOCK) {
 		pr_err("Parent image has unknown compression mode %u\n",
 		       ie->compress);
 		goto err;
@@ -510,9 +515,9 @@ int prepare_inventory(InventoryEntry *he, const InventoryEntry *parent_ie)
 	if (!he->dump_criu_run_id)
 		return -1;
 
-	if (opts.compress_mode == COMPRESS_REGION && opts.compress_region_size) {
-		he->has_compress_region_size = true;
-		he->compress_region_size = opts.compress_region_size;
+	if (opts.compress_mode == COMPRESS_BLOCK && opts.compress_block_size) {
+		he->has_compress_block_size = true;
+		he->compress_block_size = opts.compress_block_size;
 	}
 
 	return 0;

@@ -52,10 +52,6 @@ ci_prep () {
 	# This can fail on aarch64
 	service apport stop || :
 
-	# Ubuntu has set up AppArmor in 24.04 so that it blocks use of user
-	# namespaces by unprivileged users. We need this for some of our tests.
-	sysctl kernel.apparmor_restrict_unprivileged_userns=0 || :
-
 	if [ "$CLANG" = "1" ]; then
 		# clang support
 		CC=clang
@@ -88,14 +84,15 @@ test_stream() {
 	# restorer and eventually close the page read. However, image-streamer expects the
 	# whole image to be read and the image is not reopened, sent twice. These MAP_HUGETLB
 	# test cases will result in EPIPE error at the moment.
-	# Region compression (--compress-region) is incompatible with the
+	# Multi-page block compression is incompatible with the
 	# per-page image-streamer wire format, so exclude those tests from
 	# the streamed run (they are covered by the local -a runs).
 	STREAM_TEST_EXCLUDE=(-x maps09 -x maps10
-		-x compress_pages_region00
-		-x compress_pages_region01
-		-x compress_pages_region02
-		-x compress_pages_region03)
+		-x compress_pages_block00
+		-x compress_pages_block01
+		-x compress_pages_block02
+		-x compress_pages_block03
+		-x compress_pages_block04)
 	./test/zdtm.py run --stream -p 2 --keep-going -a "${STREAM_TEST_EXCLUDE[@]}" "${ZDTM_OPTS[@]}"
 	if criu/criu check --feature compress; then
 		./test/zdtm.py run --stream --compress -t zdtm/static/maps00 -t zdtm/static/env00
@@ -148,6 +145,10 @@ modprobe -v sit || :
 print_env
 
 ci_prep
+
+# Ubuntu has set up AppArmor in >= 24.04 so that it blocks use of user
+# namespaces by unprivileged users. We need this for some of our tests.
+sysctl kernel.apparmor_restrict_unprivileged_userns=0 || :
 
 if [ "${CD_TO_TOP}" = "1" ]; then
 	cd ../../
@@ -341,10 +342,10 @@ run_non_shardable_tests() {
 		./test/zdtm.py run -t zdtm/static/compress_pages00 --compress-acceleration 2
 		./test/zdtm.py run -t zdtm/static/compress_pages00 -t zdtm/static/compress_pages01 --rpc
 
-		# Add parent-chain and dedup coverage for region compression.
-		./test/zdtm.py run -t zdtm/static/compress_pages_region00 --pre 2
-		./test/zdtm.py run -t zdtm/static/compress_pages_region00 --dedup
-		./test/zdtm.py run -t zdtm/static/compress_pages_region03 --pre 2
+		# Add parent-chain and dedup coverage for block compression.
+		./test/zdtm.py run -t zdtm/static/compress_pages_block00 --pre 2
+		./test/zdtm.py run -t zdtm/static/compress_pages_block00 --dedup
+		./test/zdtm.py run -t zdtm/static/compress_pages_block03 --pre 2
 	else
 		echo "Skipping memory compression ZDTM tests"
 	fi
@@ -362,18 +363,19 @@ run_non_shardable_tests() {
 		# Hugetlb mappings are not premapped. Their blocks must remain
 		# self-contained raw/zero fallbacks for PIE restore.
 		./test/zdtm.py run -t zdtm/static/maps09 --pre 2 --compress
-		./test/zdtm.py run -t zdtm/static/maps09 --pre 2 --compress-region 256K
+		./test/zdtm.py run -t zdtm/static/maps09 --pre 2 --compress-block 256K
 		./test/zdtm.py run -t zdtm/static/maps10 --pre 2 --compress
-		./test/zdtm.py run -t zdtm/static/maps10 --pre 2 --compress-region 256K
+		./test/zdtm.py run -t zdtm/static/maps10 --pre 2 --compress-block 256K
 	else
 		echo "Skipping hugetlb compression tests"
 	fi
 
-	# Incremental compression parent chains.
+	# Compression pre-dump and incremental parent-chain coverage.
 	if criu/criu check --feature compress && criu/criu check --feature mem_dirty_track; then
+		make -C test/others/compression/vma-boundary run
 		make -C test/others/compression/incremental run
 	else
-		echo "Skipping compression/incremental test"
+		echo "Skipping compression pre-dump tests"
 	fi
 
 	# Raw compression fallback image format.

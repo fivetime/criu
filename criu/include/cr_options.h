@@ -230,8 +230,7 @@ struct cr_options {
 	/*
 	 * Memory page compression mode (enum compress_mode):
 	 *   COMPRESS_OFF       (0) = no compression (default)
-	 *   COMPRESS_PER_PAGE  (1) = each system page is its own LZ4 block
-	 *   COMPRESS_REGION    (2) = regions of compress_region_size bytes
+	 *   COMPRESS_BLOCK     (1) = chunks of compress_block_size bytes
 	 *                            are compressed as one LZ4 block
 	 *
 	 * Predicate "is compression on?" is just `if (opts.compress_mode)`.
@@ -246,11 +245,11 @@ struct cr_options {
 	unsigned int compress_acceleration;
 
 	/*
-	 * Region size in bytes when compress_mode == COMPRESS_REGION.
-	 * Must be a multiple of PAGE_SIZE and <= MAX_REGION_SIZE.
+	 * Block size in bytes when compress_mode == COMPRESS_BLOCK.
+	 * Must be a multiple of PAGE_SIZE and <= MAX_BLOCK_SIZE.
 	 * 0 means "use default".
 	 */
-	unsigned int compress_region_size;
+	unsigned int compress_block_size;
 
 	/*
 	 * Worker concurrency for LZ4 decoding and eligible large zero fills,

@@ -5,6 +5,11 @@ Podman SGLang Checkpoint/Restore Benchmark
 Starts an SGLang container with Podman, validates inference, checkpoints it with
 Podman, removes it, restores it with Podman, and validates inference again.
 
+GPU runs enable SGLang's memory saver by default. Before checkpoint the driver
+pauses generation and releases SGLang-managed GPU allocations; after restore it
+resumes those allocations and generation. This avoids checkpointing CUDA IPC /
+registered VRAM. Pass --disable-memory-saver only for diagnostic comparisons.
+
 This benchmarks Podman's container checkpoint/restore path while varying CRIU
 memory-page compression through /etc/criu/runc.conf. Podman's own checkpoint
 archive compression is kept at "none" by default so the reported archive size
@@ -13,7 +18,7 @@ reflects CRIU image size rather than tar-level gzip/zstd compression.
 Example:
   sudo HF_TOKEN=... python3 contrib/compression-benchmark/podman-sglang.py \\
        --model Qwen/Qwen3-0.6B -n 3 \\
-       --modes uncompressed lz4-page lz4-region
+       --modes uncompressed lz4-block --block-sizes 4096 262144
 
 CPU-only example (requires an SGLang CPU image):
   sudo python3 contrib/compression-benchmark/podman-sglang.py \\
@@ -77,6 +82,25 @@ class SglangAdapter:
     @staticmethod
     def add_server_arguments(parser):
         parser.add_argument(
+            "--disable-memory-saver",
+            dest="memory_saver",
+            action="store_false",
+            default=True,
+            help="Checkpoint live CUDA allocations instead of releasing "
+                 "SGLang GPU memory first (not recommended)",
+        )
+        parser.add_argument(
+            "--cuda-checkpoint-launch-job",
+            action="store_true",
+            help="Launch SGLang through cuda-checkpoint --launch-job so all "
+                 "CUDA workers inherit one checkpoint job file",
+        )
+        parser.add_argument(
+            "--cuda-checkpoint-binary",
+            default="/usr/local/bin/cuda-checkpoint",
+            help="Host cuda-checkpoint binary mounted into the container",
+        )
+        parser.add_argument(
             "--sglang-arg",
             action="append",
             default=[],
@@ -102,6 +126,25 @@ class SglangAdapter:
                 "chat_template_kwargs", {"enable_thinking": False}
             )
             args.chat_extra_json = extra
+        if args.cuda_checkpoint_launch_job:
+            if args.accelerator != "gpu":
+                raise RuntimeError(
+                    "--cuda-checkpoint-launch-job requires --accelerator gpu"
+                )
+            if not os.path.isfile(args.cuda_checkpoint_binary):
+                raise RuntimeError(
+                    "cuda-checkpoint binary not found: "
+                    f"{args.cuda_checkpoint_binary}"
+                )
+
+    @staticmethod
+    def extra_podman_args(args):
+        if not getattr(args, "cuda_checkpoint_launch_job", False):
+            return []
+        return [
+            "--volume",
+            f"{args.cuda_checkpoint_binary}:/usr/local/bin/cuda-checkpoint:ro",
+        ]
 
     @staticmethod
     def cpu_podman_args(args):
@@ -115,6 +158,10 @@ class SglangAdapter:
     def server_argv(args):
         command = [
             args.image,
+        ]
+        if getattr(args, "cuda_checkpoint_launch_job", False):
+            command += ["cuda-checkpoint", "--launch-job"]
+        command += [
             "python3", "-m", "sglang.launch_server",
             f"--{args.sglang_model_arg}", args.model,
             "--host", "0.0.0.0",
@@ -125,14 +172,52 @@ class SglangAdapter:
         ]
         if args.accelerator == "gpu":
             command += ["--mem-fraction-static", str(args.mem_fraction_static)]
+            if args.memory_saver and "--enable-memory-saver" not in args.sglang_arg:
+                command.append("--enable-memory-saver")
         else:
             command += ["--device", "cpu", "--disable-overlap-schedule"]
         command += args.sglang_arg
         return command
 
     @staticmethod
+    def _memory_control(args, operations):
+        if getattr(args, "accelerator", None) != "gpu" or not getattr(
+                args, "memory_saver", False):
+            return
+        for endpoint, payload in operations:
+            print(f"  SGLang memory saver: {endpoint}", flush=True)
+            try:
+                common.http_json(
+                    "POST",
+                    f"{args.base_url.rstrip('/')}/{endpoint}",
+                    payload,
+                    args.request_timeout,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"SGLang memory-saver request {endpoint} failed: {exc}"
+                ) from exc
+
+    @classmethod
+    def before_checkpoint(cls, args):
+        cls._memory_control(args, [
+            ("pause_generation", {"mode": "abort"}),
+            ("release_memory_occupation", {}),
+        ])
+
+    @classmethod
+    def after_restore(cls, args):
+        cls._memory_control(args, [
+            ("resume_memory_occupation", {}),
+            ("continue_generation", {}),
+        ])
+
+    @staticmethod
     def server_summary(args):
-        return f"model-arg={args.sglang_model_arg}"
+        memory_saver = "on" if args.memory_saver else "off"
+        launch_job = "on" if args.cuda_checkpoint_launch_job else "off"
+        return (f"model-arg={args.sglang_model_arg}, "
+                f"memory-saver={memory_saver}, launch-job={launch_job}")
 
 
 _benchmark = common.ServingBenchmark(SglangAdapter(), __doc__)

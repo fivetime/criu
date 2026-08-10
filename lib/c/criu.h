@@ -62,12 +62,11 @@ enum criu_image_io_mode {
 
 enum criu_compress_mode {
 	CRIU_COMPRESS_OFF = 0,
-	CRIU_COMPRESS_PER_PAGE = 1,
-	CRIU_COMPRESS_REGION = 2,
+	CRIU_COMPRESS_BLOCK = 1,
 };
 
 #define CRIU_COMPRESS_MAX_ACCELERATION 65537U
-#define CRIU_COMPRESS_MAX_REGION_SIZE  (4U * 1024U * 1024U)
+#define CRIU_COMPRESS_MAX_BLOCK_SIZE   (4U * 1024U * 1024U)
 /* Maximum explicit setting; automatic concurrency is not capped by it. */
 #define CRIU_DECOMPRESS_MAX_THREADS    1024U
 
@@ -103,7 +102,7 @@ void criu_set_file_locks(bool file_locks);
 void criu_set_track_mem(bool track_mem);
 int criu_set_compress(enum criu_compress_mode mode);
 int criu_set_compress_acceleration(unsigned int acceleration);
-int criu_set_compress_region_size(unsigned int bytes);
+int criu_set_compress_block_size(unsigned int bytes);
 /*
  * Worker concurrency for LZ4 decoding and eligible large zero fills:
  * 0 = auto, 1 = serial/no zero-fill workers (default), N > 1 = aggregate
@@ -277,7 +276,7 @@ void criu_local_set_file_locks(criu_opts *opts, bool file_locks);
 void criu_local_set_track_mem(criu_opts *opts, bool track_mem);
 int criu_local_set_compress(criu_opts *opts, enum criu_compress_mode mode);
 int criu_local_set_compress_acceleration(criu_opts *opts, unsigned int acceleration);
-int criu_local_set_compress_region_size(criu_opts *opts, unsigned int bytes);
+int criu_local_set_compress_block_size(criu_opts *opts, unsigned int bytes);
 /* Uses the same worker-concurrency values as criu_set_decompress_threads(). */
 int criu_local_set_decompress_threads(criu_opts *opts, unsigned int threads);
 void criu_local_set_auto_dedup(criu_opts *opts, bool auto_dedup);

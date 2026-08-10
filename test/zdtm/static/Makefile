@@ -7,8 +7,8 @@ TST_NOFILE	:=				\
 		pages_content01			\
 		pages_content03			\
 		compress_pages01			\
-		compress_pages_region01			\
-		compress_pages_region03			\
+		compress_pages_block01			\
+		compress_pages_block03			\
 		busyloop00			\
 		sleeping00			\
 		pid00				\
@@ -332,8 +332,9 @@ TST_FILE	=				\
 			pages_content02		\
 			compress_pages00		\
 			compress_pages02		\
-			compress_pages_region00		\
-			compress_pages_region02		\
+			compress_pages_block00		\
+			compress_pages_block02		\
+			compress_pages_block04		\
 		maps06				\
 		write_read00			\
 		write_read01			\

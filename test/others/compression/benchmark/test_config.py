@@ -35,7 +35,7 @@ class PodmanConfigTests(unittest.TestCase):
         cls.sglang = load_script("podman-sglang.py")
         cls.common = cls.vllm.common
         cls.main = load_script("main.py")
-        cls.region_cache = load_script("region-cache.py")
+        cls.block_cache = load_script("block-cache.py")
 
     def test_serving_frontends_share_code_not_runtime_state(self):
         self.assertIs(self.vllm.common, self.sglang.common)
@@ -46,6 +46,32 @@ class PodmanConfigTests(unittest.TestCase):
     def test_shared_serving_format_helpers_have_explicit_names(self):
         self.assertEqual(self.common.format_bytes(1048576), "1.0 MB")
         self.assertEqual(self.common.format_duration(1000), "1.0 ms")
+
+    def test_container_removal_retries_transient_runtime_failure(self):
+        failed = self.common.subprocess.CompletedProcess(
+            [], 1, "", "given PID did not die within timeout"
+        )
+        removed = self.common.subprocess.CompletedProcess([], 0, "", "")
+        with (
+            mock.patch.object(
+                self.common, "run_cmd", side_effect=[failed, removed]
+            ) as run,
+            mock.patch.object(self.common.time, "sleep") as sleep,
+        ):
+            self.common.remove_container("restored-sglang")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_container_removal_reports_persistent_failure(self):
+        failed = self.common.subprocess.CompletedProcess(
+            [], 1, "", "container remains stuck"
+        )
+        with (
+            mock.patch.object(self.common, "run_cmd", return_value=failed),
+            mock.patch.object(self.common.time, "sleep"),
+            self.assertRaisesRegex(RuntimeError, "failed after 3 attempts"),
+        ):
+            self.common.remove_container("restored-sglang")
 
     def test_decompression_thread_labels_distinguish_default_and_auto(self):
         for module in (self.main, self.common):
@@ -91,14 +117,28 @@ class PodmanConfigTests(unittest.TestCase):
             ["--decompress-threads", "0"],
         )
 
-        cfg = {"mode": "lz4-page", "region_size": 0}
+        cfg = {"mode": "lz4-block", "block_size": 4096}
         self.assertEqual(
-            self.common.compression_config_lines(cfg, 1, None), ["compress"]
+            self.common.compression_config_lines(cfg, 1, None),
+            ["compress-block 4096"]
         )
         self.assertEqual(
             self.common.compression_config_lines(cfg, 1, 0),
-            ["compress", "decompress-threads 0"],
+            ["compress-block 4096", "decompress-threads 0"],
         )
+
+    def test_default_block_sizes_follow_host_page_size(self):
+        expected = {
+            4096: [4096, 65536, 262144, 1048576],
+            16384: [16384, 65536, 262144, 1048576],
+            65536: [65536, 262144, 1048576],
+        }
+        for module in (self.main, self.common):
+            for page_size, block_sizes in expected.items():
+                with self.subTest(module=module.__name__, page_size=page_size):
+                    self.assertEqual(
+                        module.default_block_sizes(page_size), block_sizes
+                    )
 
     def test_podman_environment_uses_no_default_config_wrapper(self):
         args = SimpleNamespace(criu_libdir=None)
@@ -168,24 +208,24 @@ class PodmanConfigTests(unittest.TestCase):
                 self.assertIn(wrapper_dir, module._benchmark.state.tempdirs)
                 module._benchmark.state.tempdirs.discard(wrapper_dir)
 
-    def test_region_cache_marker_write_is_atomic_and_cleans_failure(self):
+    def test_block_cache_marker_write_is_atomic_and_cleans_failure(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ready")
-            self.region_cache.atomic_write_text(path, "123\n")
+            self.block_cache.atomic_write_text(path, "123\n")
             with open(path) as marker:
                 self.assertEqual(marker.read(), "123\n")
 
             failed_path = os.path.join(d, "failed")
             with (
                 mock.patch.object(
-                    self.region_cache.os, "replace",
+                    self.block_cache.os, "replace",
                     side_effect=OSError("injected rename failure"),
                 ),
                 self.assertRaisesRegex(OSError, "injected rename failure"),
             ):
-                self.region_cache.atomic_write_text(failed_path, "456\n")
+                self.block_cache.atomic_write_text(failed_path, "456\n")
             self.assertEqual(
                 list(Path(d).glob("failed.tmp.*")), [],
             )
@@ -194,7 +234,7 @@ class PodmanConfigTests(unittest.TestCase):
         cases = (
             (self.main, ["--modes", "uncompressed", "uncompressed"]),
             (self.vllm, ["--modes", "uncompressed", "uncompressed"]),
-            (self.sglang, ["--region-sizes", "65536", "65536"]),
+            (self.sglang, ["--block-sizes", "65536", "65536"]),
         )
         for module, arguments in cases:
             with (
@@ -221,6 +261,41 @@ class PodmanConfigTests(unittest.TestCase):
                     module.inventory_bytes_from_archive(archive), payload
                 )
 
+    def test_checkpoint_and_restore_preserve_file_locks(self):
+        args = SimpleNamespace(
+            archive_compression="none",
+            base_url="http://127.0.0.1:30000",
+            compress_acceleration=1,
+            decompress_threads=None,
+            health_path="/health",
+            keep_checkpoint_files=False,
+            print_stats=False,
+            runc_conf="/etc/criu/runc.conf",
+            wait_seconds=1,
+        )
+        completed = self.common.subprocess.CompletedProcess(
+            [], 0, stdout="", stderr=""
+        )
+        for module in (self.vllm, self.sglang):
+            with (
+                self.subTest(module=module.__name__),
+                mock.patch.object(module.common, "set_runc_conf_for_cfg"),
+                mock.patch.object(module.common, "podman_env", return_value={}),
+                mock.patch.object(
+                    module.common, "run_cmd", return_value=completed
+                ) as run,
+                mock.patch.object(module.common, "wait_health"),
+            ):
+                module._benchmark.checkpoint_container(
+                    "container", "/tmp/checkpoint.tar",
+                    {"mode": "uncompressed", "block_size": 0}, args,
+                )
+                self.assertIn("--file-locks", run.call_args.args[0])
+                module._benchmark.restore_container(
+                    "container", "/tmp/checkpoint.tar", args,
+                )
+                self.assertIn("--file-locks", run.call_args.args[0])
+
     def test_checkpoint_archive_inventory_is_decoded(self):
         import tempfile
 
@@ -238,8 +313,8 @@ class PodmanConfigTests(unittest.TestCase):
                 "magic": "INVENTORY",
                 "entries": [{
                     "img_version": 1,
-                    "compress": 2,
-                    "compress_region_size": 65536,
+                    "compress": 1,
+                    "compress_block_size": 65536,
                 }],
             })
         for module in (self.vllm, self.sglang):
@@ -252,15 +327,14 @@ class PodmanConfigTests(unittest.TestCase):
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", DeprecationWarning)
                     entry = module.inventory_entry_from_archive(archive)
-                self.assertEqual(entry["compress"], 2)
+                self.assertEqual(entry["compress"], 1)
 
-    def test_checkpoint_archive_mode_and_region_are_verified(self):
+    def test_checkpoint_archive_mode_and_block_are_verified(self):
         configurations = (
-            ({"mode": "uncompressed", "region_size": 0}, {}, 0),
-            ({"mode": "lz4-page", "region_size": 0}, {"compress": 1}, 1),
-            ({"mode": "lz4-region", "region_size": 65536}, {
-                "compress": 2, "compress_region_size": 65536,
-            }, 2),
+            ({"mode": "uncompressed", "block_size": 0}, {}, 0),
+            ({"mode": "lz4-block", "block_size": 65536}, {
+                "compress": 1, "compress_block_size": 65536,
+            }, 1),
         )
         for module in (self.vllm, self.sglang):
             for cfg, entry, expected in configurations:
@@ -285,27 +359,27 @@ class PodmanConfigTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "does not match"),
             ):
                 module.verify_archive_compression(
-                    "archive", {"mode": "uncompressed", "region_size": 0}
+                    "archive", {"mode": "uncompressed", "block_size": 0}
                 )
 
             with (
-                self.subTest(module=module.__name__, region_mismatch=True),
+                self.subTest(module=module.__name__, block_mismatch=True),
                 mock.patch.object(
                     module.common, "inventory_entry_from_archive",
                     return_value={
-                        "compress": 2, "compress_region_size": 131072,
+                        "compress": 1, "compress_block_size": 131072,
                     },
                 ),
-                self.assertRaisesRegex(RuntimeError, "region does not match"),
+                self.assertRaisesRegex(RuntimeError, "block does not match"),
             ):
                 module.verify_archive_compression(
-                    "archive", {"mode": "lz4-region", "region_size": 65536}
+                    "archive", {"mode": "lz4-block", "block_size": 65536}
                 )
 
     def test_uncompressed_mode_removes_ambient_compression(self):
         source = """manage-cgroups ignore
 compress
-compress-region=65536
+compress-block=65536
 compress_acceleration 2
 decompress-threads 4
 # keep this comment
@@ -324,7 +398,7 @@ log-file /tmp/criu.log"""
                 )
                 self.assertEqual(
                     module.compression_config_lines(
-                        {"mode": "uncompressed", "region_size": 0}, 2, 4
+                        {"mode": "uncompressed", "block_size": 0}, 2, 4
                     ),
                     [],
                 )
@@ -339,7 +413,7 @@ log-file /tmp/criu.log"""
                 with open(path, "w") as f:
                     f.write(original)
                 module.set_runc_conf_for_cfg(
-                    path, {"mode": "uncompressed", "region_size": 0}, 1, 0
+                    path, {"mode": "uncompressed", "block_size": 0}, 1, 0
                 )
                 with open(path) as f:
                     active = f.read()
@@ -356,7 +430,7 @@ log-file /tmp/criu.log"""
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as d:
                 path = os.path.join(d, "runc.conf")
                 module.set_runc_conf_for_cfg(
-                    path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                    path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
                 )
                 self.assertTrue(os.path.isfile(path))
                 self.assertEqual(os.stat(path).st_mode & 0o7777, 0o600)
@@ -371,12 +445,12 @@ log-file /tmp/criu.log"""
             with open(path, "w") as f:
                 f.write("manage-cgroups ignore\n")
             self.vllm.set_runc_conf_for_cfg(
-                path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
             )
             try:
                 with self.assertRaisesRegex(RuntimeError, "another.*benchmark"):
                     self.sglang.set_runc_conf_for_cfg(
-                        path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                        path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
                     )
             finally:
                 self.vllm.restore_runc_conf()
@@ -393,7 +467,7 @@ log-file /tmp/criu.log"""
             os.symlink("real.conf", path)
 
             self.vllm.set_runc_conf_for_cfg(
-                path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
             )
             self.assertTrue(os.path.islink(path))
 
@@ -405,7 +479,7 @@ log-file /tmp/criu.log"""
                 self.common._RUNC_CONF_UNSET
             )
             self.sglang.set_runc_conf_for_cfg(
-                path, {"mode": "uncompressed", "region_size": 0}, 1, 0
+                path, {"mode": "uncompressed", "block_size": 0}, 1, 0
             )
             self.sglang.restore_runc_conf()
 
@@ -433,7 +507,7 @@ log-file /tmp/criu.log"""
             ):
                 with self.assertRaisesRegex(RuntimeError, "simulated power loss"):
                     self.vllm.set_runc_conf_for_cfg(
-                        path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                        path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
                     )
             with open(path) as f:
                 self.assertIn("compress", f.read())
@@ -445,7 +519,7 @@ log-file /tmp/criu.log"""
                 self.common._RUNC_CONF_UNSET
             )
             self.sglang.set_runc_conf_for_cfg(
-                path, {"mode": "uncompressed", "region_size": 0}, 1, 0
+                path, {"mode": "uncompressed", "block_size": 0}, 1, 0
             )
             self.sglang.restore_runc_conf()
             with open(path) as f:
@@ -460,7 +534,7 @@ log-file /tmp/criu.log"""
             with open(path, "w") as f:
                 f.write(original)
             self.vllm.set_runc_conf_for_cfg(
-                path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
             )
             state_path = self.vllm._benchmark.state.runc_conf_state_path
             real_unlink = self.vllm.os.unlink
@@ -480,7 +554,7 @@ log-file /tmp/criu.log"""
             self.assertTrue(os.path.exists(state_path))
 
             self.sglang.set_runc_conf_for_cfg(
-                path, {"mode": "uncompressed", "region_size": 0}, 1, 0
+                path, {"mode": "uncompressed", "block_size": 0}, 1, 0
             )
             self.sglang.restore_runc_conf()
             with open(path) as f:
@@ -497,12 +571,12 @@ log-file /tmp/criu.log"""
             os.symlink("real.conf", alias)
 
             self.vllm.set_runc_conf_for_cfg(
-                alias, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                alias, {"mode": "lz4-block", "block_size": 4096}, 1, 0
             )
             try:
                 with self.assertRaisesRegex(RuntimeError, "another.*benchmark"):
                     self.sglang.set_runc_conf_for_cfg(
-                        target, {"mode": "uncompressed", "region_size": 0},
+                        target, {"mode": "uncompressed", "block_size": 0},
                         1, 0
                     )
             finally:
@@ -519,7 +593,7 @@ log-file /tmp/criu.log"""
                 f.write(original)
 
             self.vllm.set_runc_conf_for_cfg(
-                path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
             )
             state_path = (os.path.realpath(path) +
                           ".compression-benchmark.lock.state")
@@ -532,7 +606,7 @@ log-file /tmp/criu.log"""
 
             with self.assertRaisesRegex(RuntimeError, "changed outside"):
                 self.sglang.set_runc_conf_for_cfg(
-                    path, {"mode": "uncompressed", "region_size": 0}, 1, 0
+                    path, {"mode": "uncompressed", "block_size": 0}, 1, 0
                 )
             with open(path) as f:
                 self.assertEqual(f.read(), administrator_edit)
@@ -547,7 +621,7 @@ log-file /tmp/criu.log"""
                 f.write("manage-cgroups ignore\n")
 
             self.vllm.set_runc_conf_for_cfg(
-                path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
             )
             state_path = (os.path.realpath(path) +
                           ".compression-benchmark.lock.state")
@@ -561,7 +635,7 @@ log-file /tmp/criu.log"""
 
             with self.assertRaisesRegex(RuntimeError, "changed outside"):
                 self.sglang.set_runc_conf_for_cfg(
-                    path, {"mode": "uncompressed", "region_size": 0},
+                    path, {"mode": "uncompressed", "block_size": 0},
                     1, 0
                 )
             self.assertEqual(os.stat(path).st_mtime_ns,
@@ -590,7 +664,7 @@ log-file /tmp/criu.log"""
                 before = os.stat(path)
 
                 module.set_runc_conf_for_cfg(
-                    path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                    path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
                 )
                 active = os.stat(path)
                 self.assertEqual(active.st_mode & 0o7777, 0o600)
@@ -623,7 +697,7 @@ log-file /tmp/criu.log"""
                 before = os.stat(path)
 
                 module.set_runc_conf_for_cfg(
-                    path, {"mode": "lz4-page", "region_size": 0}, 1, 0
+                    path, {"mode": "lz4-block", "block_size": 4096}, 1, 0
                 )
                 module.restore_runc_conf()
 
@@ -730,6 +804,67 @@ log-file /tmp/criu.log"""
                 self.assertNotIn("CUDA_VISIBLE_DEVICES", joined)
                 self.assertIn("HF_TOKEN", command)
 
+    def test_sglang_gpu_enables_memory_saver_by_default(self):
+        args = SimpleNamespace(
+            accelerator="gpu", image="sglang-image", model="tiny-model",
+            sglang_model_arg="model-path", port=30000,
+            max_total_tokens=128, context_length=128,
+            tensor_parallel_size=1, mem_fraction_static=0.35,
+            memory_saver=True, sglang_arg=[],
+        )
+        command = self.sglang.SglangAdapter.server_argv(args)
+        self.assertIn("--enable-memory-saver", command)
+
+        args.memory_saver = False
+        command = self.sglang.SglangAdapter.server_argv(args)
+        self.assertNotIn("--enable-memory-saver", command)
+
+    def test_sglang_cuda_checkpoint_launch_job_wraps_server(self):
+        args = SimpleNamespace(
+            accelerator="gpu", image="sglang-image", model="tiny-model",
+            sglang_model_arg="model-path", port=30000,
+            max_total_tokens=128, context_length=128,
+            tensor_parallel_size=1, mem_fraction_static=0.35,
+            memory_saver=True, sglang_arg=[],
+            cuda_checkpoint_launch_job=True,
+            cuda_checkpoint_binary="/host/cuda-checkpoint",
+        )
+        command = self.sglang.SglangAdapter.server_argv(args)
+        self.assertEqual(
+            command[:5],
+            ["sglang-image", "cuda-checkpoint", "--launch-job", "python3", "-m"],
+        )
+        self.assertEqual(
+            self.sglang.SglangAdapter.extra_podman_args(args),
+            ["--volume", "/host/cuda-checkpoint:/usr/local/bin/cuda-checkpoint:ro"],
+        )
+
+    def test_sglang_memory_saver_wraps_checkpoint_restore(self):
+        args = SimpleNamespace(
+            accelerator="gpu", memory_saver=True,
+            base_url="http://127.0.0.1:30000", request_timeout=10,
+        )
+        calls = []
+
+        def http_json(method, url, payload, timeout):
+            calls.append((method, url, payload, timeout))
+            return {}
+
+        with mock.patch.object(self.sglang.common, "http_json",
+                               side_effect=http_json):
+            self.sglang.SglangAdapter.before_checkpoint(args)
+            self.sglang.SglangAdapter.after_restore(args)
+
+        self.assertEqual(
+            [(call[1].rsplit("/", 1)[-1], call[2]) for call in calls],
+            [
+                ("pause_generation", {"mode": "abort"}),
+                ("release_memory_occupation", {}),
+                ("resume_memory_occupation", {}),
+                ("continue_generation", {}),
+            ],
+        )
+
     def test_health_wait_fails_immediately_for_exited_container(self):
         for module in (self.vllm, self.sglang):
             with (
@@ -748,6 +883,38 @@ log-file /tmp/criu.log"""
                     "http://127.0.0.1:30000", "/health", 1200,
                     "failed-container", module._benchmark.adapter.display_name,
                 )
+
+    def test_streaming_chat_records_first_token_and_complete_response(self):
+        response = io.BytesIO(
+            b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+            b'data: {"choices":[{"delta":{"content":"he"}}]}\n\n'
+            b'data: {"choices":[{"delta":{"content":"llo"}}]}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        started_ns = self.common.time.monotonic_ns()
+        with mock.patch.object(
+            self.common.urllib.request, "urlopen", return_value=response
+        ):
+            timing = self.common.chat_stream_once(
+                "http://127.0.0.1:30000", "model", "prompt", 4, 0, 42,
+                10, started_ns,
+            )
+        self.assertEqual(timing["content"], "hello")
+        self.assertLessEqual(
+            timing["operation_to_first_event_us"],
+            timing["operation_to_first_token_us"],
+        )
+        self.assertLessEqual(
+            timing["operation_to_first_token_us"],
+            timing["operation_to_response_complete_us"],
+        )
+        self.assertLessEqual(
+            timing["request_to_headers_us"],
+            timing["request_to_first_token_us"],
+        )
+        self.assertLessEqual(
+            timing["request_to_first_token_us"], timing["request_us"]
+        )
 
     @staticmethod
     def trial_args():
@@ -770,12 +937,15 @@ log-file /tmp/criu.log"""
     def run_mocked_trial(self, module, workdir, responses, keep_running=False):
         events = []
 
-        def start(*_args):
-            events.append("start")
-
-        def chat(*_args):
-            events.append("chat")
-            return 10, responses.pop(0)
+        def stream_chat(*_args):
+            events.append("stream_chat")
+            return {
+                "request_us": 10,
+                "operation_to_first_token_us": 40,
+                "operation_to_response_complete_us": 50,
+                "request_to_first_token_us": 5,
+                "content": responses.pop(0),
+            }
 
         def checkpoint(*_args):
             events.append("checkpoint")
@@ -791,12 +961,24 @@ log-file /tmp/criu.log"""
 
         def restore(*_args):
             events.append("restore")
-            return 30, "restore stats"
+            return {
+                "started_ns": 2000,
+                "command_us": 30,
+                "to_health_us": 35,
+                "stats": "restore stats",
+            }
 
         benchmark = module._benchmark
         with (
-            mock.patch.object(benchmark, "start_container", side_effect=start),
-            mock.patch.object(benchmark, "chat_once", side_effect=chat),
+            mock.patch.object(
+                benchmark, "start_container",
+                side_effect=lambda *_args: {
+                    "started_ns": 1000,
+                    "to_health_us": 25,
+                },
+            ),
+            mock.patch.object(benchmark, "chat_stream_once",
+                              side_effect=stream_chat),
             mock.patch.object(benchmark, "checkpoint_container",
                               side_effect=checkpoint),
             mock.patch.object(module.common, "verify_archive_compression",
@@ -806,7 +988,7 @@ log-file /tmp/criu.log"""
             mock.patch.object(module.common.os.path, "getsize", return_value=1234),
         ):
             result = module.run_trial(
-                {"mode": "uncompressed", "region_size": 0},
+                {"mode": "uncompressed", "block_size": 0},
                 workdir,
                 self.trial_args(),
                 1,
@@ -820,15 +1002,23 @@ log-file /tmp/criu.log"""
         for module in (self.vllm, self.sglang):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as d:
                 result, events = self.run_mocked_trial(
-                    module, d, ["same response", "same response"]
+                    module, d,
+                    ["cold response", "same response", "same response"],
                 )
                 self.assertTrue(result["valid"])
                 self.assertEqual(result["archive_size"], 1234)
                 self.assertEqual(
                     events,
-                    ["start", "chat", "checkpoint", "verify", "remove",
-                     "restore", "chat", "remove"],
+                    ["stream_chat", "stream_chat", "checkpoint", "verify",
+                     "remove", "restore", "stream_chat", "remove"],
                 )
+                self.assertEqual(result["server_start_to_health_us"], 25)
+                self.assertEqual(result["cold_start_to_first_token_us"], 40)
+                self.assertEqual(result["restore_to_health_us"], 35)
+                self.assertEqual(result["restore_to_first_token_us"], 40)
+                self.assertEqual(result["cold_start_request_ttft_us"], 5)
+                self.assertEqual(result["restore_request_ttft_us"], 5)
+                self.assertEqual(result["cache_policy"], "warm")
 
     def test_mocked_framework_restore_rejects_changed_response(self):
         import tempfile
@@ -839,7 +1029,8 @@ log-file /tmp/criu.log"""
                     RuntimeError, "validation response changed"
                 ):
                     self.run_mocked_trial(
-                        module, d, ["before restore", "after restore"]
+                        module, d,
+                        ["cold response", "before restore", "after restore"],
                     )
 
     def test_keep_running_retains_only_requested_trial(self):
@@ -848,18 +1039,19 @@ log-file /tmp/criu.log"""
         for module in (self.vllm, self.sglang):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as d:
                 result, events = self.run_mocked_trial(
-                    module, d, ["same response", "same response"], True
+                    module, d,
+                    ["cold response", "same response", "same response"], True
                 )
                 self.assertIsNotNone(result["container_name"])
                 self.assertEqual(
                     events,
-                    ["start", "chat", "checkpoint", "verify", "remove",
-                     "restore", "chat"],
+                    ["stream_chat", "stream_chat", "checkpoint", "verify",
+                     "remove", "restore", "stream_chat"],
                 )
 
     def test_signal_handlers_defer_cleanup_and_are_not_reentrant(self):
         # The serving frontends keep their state on the shared benchmark
-        # object; main and region-cache keep a module-level _runtime.
+        # object; main and block-cache keep a module-level _runtime.
         handlers = (
             (self.vllm, self.vllm._benchmark.state,
              self.vllm._benchmark.signal_handler, self.vllm.cleanup),
@@ -867,8 +1059,8 @@ log-file /tmp/criu.log"""
              self.sglang._benchmark.signal_handler, self.sglang.cleanup),
             (self.main, self.main._runtime,
              self.main._sighandler, self.main._cleanup),
-            (self.region_cache, self.region_cache._runtime,
-             self.region_cache.on_signal, self.region_cache.cleanup_pids),
+            (self.block_cache, self.block_cache._runtime,
+             self.block_cache.on_signal, self.block_cache.cleanup_pids),
         )
         for module, state, handler, cleanup in handlers:
             with (
@@ -885,87 +1077,91 @@ log-file /tmp/criu.log"""
                 cleanup_mock.assert_not_called()
                 state.received_signal = None
 
-    def test_region_cache_wait_detects_child_exit(self):
+    def test_block_cache_wait_detects_child_exit(self):
         proc = mock.Mock()
         proc.poll.return_value = 17
         with (
-            mock.patch.object(self.region_cache.os.path, "exists",
+            mock.patch.object(self.block_cache.os.path, "exists",
                               return_value=False),
             self.assertRaisesRegex(
-                self.region_cache.TrialError, "exited with status 17"
+                self.block_cache.TrialError, "exited with status 17"
             ),
         ):
-            self.region_cache.wait_for_path(
+            self.block_cache.wait_for_path(
                 "/missing-readiness-file", timeout=1, proc=proc
             )
 
-    def test_region_cache_images_require_reused_lz4_region(self):
-        page_size = self.region_cache.PAGE_SIZE
+    def test_block_cache_images_require_reused_lz4_block(self):
+        page_size = self.block_cache.PAGE_SIZE
         start = 0x100000
         pre_entries = [{
             "vaddr": start,
             "nr_pages": 4,
-            "flags": self.region_cache.PE_PRESENT,
-            "region_pages": 4,
-            "compressed_size": [100],
+            "flags": self.block_cache.PE_PRESENT,
+            "blocks": {
+                "pages_per_block": 4,
+                "block_sizes": [100],
+            },
         }]
         final_entries = [
             {
                 "vaddr": start + index * page_size,
                 "nr_pages": 1,
-                "flags": (self.region_cache.PE_PRESENT if index % 2 == 0
-                          else self.region_cache.PE_PARENT),
+                "flags": (self.block_cache.PE_PRESENT if index % 2 == 0
+                          else self.block_cache.PE_PARENT),
             }
             for index in range(4)
         ]
 
-        evidence = self.region_cache.analyze_partial_region_reads(
+        evidence = self.block_cache.analyze_partial_block_reads(
             pre_entries, final_entries, start, 4 * page_size,
             4 * page_size,
         )
         self.assertEqual(evidence["partial_parent_slices"], 2)
-        self.assertEqual(evidence["reused_lz4_regions"], 1)
-        self.assertEqual(evidence["max_slices_per_region"], 2)
+        self.assertEqual(evidence["reused_lz4_blocks"], 1)
+        self.assertEqual(evidence["max_slices_per_block"], 2)
 
-        pre_entries[0]["compressed_size"] = [4 * page_size]
+        pre_entries[0]["blocks"]["block_sizes"] = [4 * page_size]
         with self.assertRaisesRegex(
-                self.region_cache.TrialError, "no LZ4-compressed region"):
-            self.region_cache.analyze_partial_region_reads(
+                self.block_cache.TrialError, "no LZ4-compressed block"):
+            self.block_cache.analyze_partial_block_reads(
                 pre_entries, final_entries, start, 4 * page_size,
                 4 * page_size,
             )
 
         pre_entries[0]["nr_pages"] = 2
-        pre_entries[0]["region_pages"] = 2
-        pre_entries[0]["compressed_size"] = [100]
+        pre_entries[0]["blocks"] = {
+            "pages_per_block": 2,
+            "block_sizes": [100],
+        }
         with self.assertRaisesRegex(
-                self.region_cache.TrialError, "repeated partial reads"):
-            self.region_cache.analyze_partial_region_reads(
+                self.block_cache.TrialError, "repeated partial reads"):
+            self.block_cache.analyze_partial_block_reads(
                 pre_entries, final_entries[:2], start, 2 * page_size,
                 2 * page_size,
             )
 
-    def test_region_cache_readiness_failure_reaps_child(self):
+    def test_block_cache_readiness_failure_reaps_child(self):
         import tempfile
 
         proc = mock.Mock(pid=12345)
         proc.poll.return_value = None
         with (
             tempfile.TemporaryDirectory() as d,
-            mock.patch.object(self.region_cache.subprocess, "Popen",
+            mock.patch.object(self.block_cache.subprocess, "Popen",
                               return_value=proc),
             mock.patch.object(
-                self.region_cache, "wait_for_path",
-                side_effect=self.region_cache.TrialError("not ready"),
+                self.block_cache, "wait_for_path",
+                side_effect=self.block_cache.TrialError("not ready"),
             ),
-            self.assertRaisesRegex(self.region_cache.TrialError, "not ready"),
+            self.assertRaisesRegex(self.block_cache.TrialError, "not ready"),
         ):
-            self.region_cache.start_workload(self.region_cache.PAGE_SIZE, d)
+            self.block_cache.start_workload(self.block_cache.PAGE_SIZE, d)
         proc.kill.assert_called_once_with()
         proc.wait.assert_called_once_with()
-        self.assertNotIn(proc.pid, self.region_cache._runtime.active_pids)
+        self.assertNotIn(proc.pid, self.block_cache._runtime.active_pids)
 
-    def test_region_cache_failure_kills_restored_workload(self):
+    def test_block_cache_failure_kills_restored_workload(self):
         import tempfile
 
         proc = mock.Mock(pid=12345)
@@ -983,31 +1179,31 @@ log-file /tmp/criu.log"""
         with (
             tempfile.TemporaryDirectory() as d,
             mock.patch.object(
-                self.region_cache, "start_workload",
+                self.block_cache, "start_workload",
                 return_value=(proc, proc.pid, 0x100000,
                               os.path.join(d, "dirty"),
                               os.path.join(d, "checksum")),
             ),
-            mock.patch.object(self.region_cache, "run_cmd",
+            mock.patch.object(self.block_cache, "run_cmd",
                               side_effect=publish_restore_pid),
-            mock.patch.object(self.region_cache, "signal_and_wait"),
+            mock.patch.object(self.block_cache, "signal_and_wait"),
             mock.patch.object(
-                self.region_cache, "validate_region_cache_images",
-                return_value={"reused_lz4_regions": 1},
+                self.block_cache, "validate_block_cache_images",
+                return_value={"reused_lz4_blocks": 1},
             ),
-            mock.patch.object(self.region_cache, "expected_checksum",
+            mock.patch.object(self.block_cache, "expected_checksum",
                               return_value="expected"),
-            mock.patch.object(self.region_cache.os, "kill") as kill_mock,
+            mock.patch.object(self.block_cache.os, "kill") as kill_mock,
         ):
-            result = self.region_cache.run_trial(
-                "/usr/bin/criu", self.region_cache.PAGE_SIZE,
-                self.region_cache.PAGE_SIZE, "expected", d, False,
+            result = self.block_cache.run_trial(
+                "/usr/bin/criu", self.block_cache.PAGE_SIZE,
+                self.block_cache.PAGE_SIZE, "expected", d, False,
             )
 
         self.assertFalse(result["ok"])
         kill_mock.assert_any_call(restored_pid, signal.SIGKILL)
         self.assertNotIn(
-            restored_pid, self.region_cache._runtime.active_pids
+            restored_pid, self.block_cache._runtime.active_pids
         )
 
 
