@@ -747,7 +747,7 @@ static int collect_cgroups(struct list_head *ctls)
 	int fd = -1;
 
 	list_for_each_entry(cc, ctls, l) {
-		char path[PATH_MAX], *root;
+		char path[PATH_MAX], namespace_root[PATH_MAX], *root;
 		struct cg_controller *cg;
 		struct cg_root_opt *o;
 
@@ -809,6 +809,17 @@ static int collect_cgroups(struct list_head *ctls)
 		path_pref_len = snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
 
 		root = cc->path;
+		if (cc->cgns_prefix > 0) {
+			if (cc->cgns_prefix >= sizeof(namespace_root) || cc->cgns_prefix > strlen(cc->path)) {
+				pr_err("Invalid cgroup namespace root length %u\n", cc->cgns_prefix);
+				close_safe(&fd);
+				return -1;
+			}
+			/* Empty namespace ancestors still own controllers needed by task cgroups. */
+			memcpy(namespace_root, cc->path, cc->cgns_prefix);
+			namespace_root[cc->cgns_prefix] = '\0';
+			root = namespace_root;
+		}
 		if (opts.new_global_cg_root)
 			root = opts.new_global_cg_root;
 
@@ -817,7 +828,11 @@ static int collect_cgroups(struct list_head *ctls)
 				root = o->newroot;
 		}
 
-		snprintf(path + path_pref_len, PATH_MAX - path_pref_len, "%s", root);
+		if (snprintf(path + path_pref_len, PATH_MAX - path_pref_len, "%s", root) >= PATH_MAX - path_pref_len) {
+			pr_err("Cgroup dump path is too long\n");
+			close_safe(&fd);
+			return -1;
+		}
 
 		ret = ftw(path, add_cgroup, 4);
 
@@ -1955,6 +1970,8 @@ static int restore_special_props(char *paux, size_t paux_size, size_t off, Cgrou
 
 		if (!is_special_property(prop->name))
 			continue;
+		if (cgroup_property_perms_only(prop->name) || !strcmp(prop->name, "cgroup.subtree_control"))
+			continue;
 
 		if (restore_special_property(paux, paux_size, off, prop) < 0) {
 			pr_err("Restoring %s special property failed\n", prop->name);
@@ -2041,15 +2058,6 @@ static int prepare_cgroup_dirs(char **cnames, int n_cnames, char *paux, size_t p
 			if (!(opts.manage_cgroups & CG_MODE_NONE) && prepare_dir_perms(cg, paux, e->dir_perms) < 0)
 				return -1;
 
-			/* Full/props mode also repairs access to files in pre-existing cgroups. */
-			for (j = 0; j < e->n_properties; j++) {
-				CgroupPropEntry *p = e->properties[j];
-
-				if (!cgroup_property_perms_only(p->name) && strcmp(p->name, "cgroup.subtree_control"))
-					continue;
-				if (restore_cgroup_prop(p, paux, off2, false, false) < 0)
-					return -1;
-			}
 		}
 
 		if (prepare_cgroup_dirs(cnames, n_cnames, paux, paux_size, off2, e->children, e->n_children) < 0)
@@ -2076,6 +2084,57 @@ static int prepare_cgroup_dirs(char **cnames, int n_cnames, char *paux, size_t p
  * loose the ability to mount cgroups on-demand, so prepare
  * them in advance.
  */
+
+static int restore_cgroup_access(char *path, size_t off, CgroupDirEntry **ents, size_t n_ents)
+{
+	size_t i, j;
+
+	for (i = 0; i < n_ents; i++) {
+		CgroupDirEntry *e = ents[i];
+		int len = snprintf(path + off, PATH_MAX - off, "/%s", e->dir_name);
+		size_t off2;
+
+		if (len < 0 || len >= PATH_MAX - off) {
+			pr_err("Cgroup access property path is too long\n");
+			return -1;
+		}
+		off2 = off + len;
+
+		for (j = 0; j < e->n_properties; j++) {
+			CgroupPropEntry *p = e->properties[j];
+
+			if (!cgroup_property_perms_only(p->name) && strcmp(p->name, "cgroup.subtree_control"))
+				continue;
+			if (restore_cgroup_prop(p, path, off2, false, false) < 0)
+				return -1;
+		}
+		if (restore_cgroup_access(path, off2, e->children, e->n_children) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+static int prepare_cgroup_access(void *arg, int fd, pid_t pid)
+{
+	char path[PATH_MAX];
+	unsigned int i;
+
+	for (i = 0; i < n_controllers; i++) {
+		CgControllerEntry *c = controllers[i];
+		int off = ctrl_dir_and_opt(c, path, sizeof(path), NULL, 0);
+
+		if (off < 0 || restore_cgroup_access(path, off, c->dirs, c->n_dirs) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+int prepare_cgroup_early_properties(void)
+{
+	if (opts.manage_cgroups == CG_MODE_IGNORE)
+		return 0;
+	return userns_call(prepare_cgroup_access, 0, NULL, 0, -1);
+}
 
 static int prepare_cgroup_sfd(CgroupEntry *ce)
 {
