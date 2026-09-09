@@ -432,6 +432,7 @@ TST_DIR		=				\
 		shared_disjoint_roots		\
 		cgroupv2_fds			\
 		cgroupv2_fds_existing		\
+		cgroupv2_fds_namespace		\
 		shared_mount_propagation	\
 		overmount_with_shared_parent	\
 		inotify00			\

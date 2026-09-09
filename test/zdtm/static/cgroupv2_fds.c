@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <limits.h>
+#include <sched.h>
 #include <sys/inotify.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -26,15 +27,21 @@ int main(int argc, char **argv)
 	ssprintf(path, "%s/zdtm-cgroupv2-fds", dirname);
 	if (mkdir(path, 0755))
 		return 1;
-	ssprintf(path, "%s/zdtm-cgroupv2-fds/cgroup.subtree_control", dirname);
-	if (write_value(path, "+memory"))
+#ifdef CGROUPNS_ROOT
+	ssprintf(path, "%s/zdtm-cgroupv2-fds/cgroup.procs", dirname);
+	ssprintf(value, "%d", getpid());
+	if (write_value(path, value) || unshare(CLONE_NEWCGROUP))
 		return 1;
+#endif
 	ssprintf(path, "%s/zdtm-cgroupv2-fds/leaf", dirname);
 	if (mkdir(path, 0755))
 		return 1;
 	ssprintf(path, "%s/zdtm-cgroupv2-fds/leaf/cgroup.procs", dirname);
 	ssprintf(value, "%d", getpid());
 	if (write_value(path, value))
+		return 1;
+	ssprintf(path, "%s/zdtm-cgroupv2-fds/cgroup.subtree_control", dirname);
+	if (write_value(path, "+memory"))
 		return 1;
 	ssprintf(path, "%s/zdtm-cgroupv2-fds/leaf/memory.pressure", dirname);
 	if (chown(path, 1000, 1000) || chmod(path, 0600) || pipe(ready) || pipe(done))

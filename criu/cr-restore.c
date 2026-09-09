@@ -1605,6 +1605,9 @@ static int __restore_task_with_children(void *_arg)
 	 */
 	if (restore_task_cgroup(current) < 0)
 		goto err;
+	/* Leave the namespace root before enabling its domain controllers. */
+	if (current->parent == NULL && prepare_cgroup_early_properties() < 0)
+		goto err;
 
 	/* Restore root task */
 	if (current->parent == NULL) {
