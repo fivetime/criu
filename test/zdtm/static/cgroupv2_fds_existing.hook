@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+if [ "$1" = --pre-restore ]; then
+    chown 0:0 /sys/fs/cgroup/zdtm-cgroupv2-fds/leaf/memory.pressure
+    chmod 0644 /sys/fs/cgroup/zdtm-cgroupv2-fds/leaf/memory.pressure
+    printf '%s\n' '-memory' > /sys/fs/cgroup/zdtm-cgroupv2-fds/cgroup.subtree_control
+elif [ "$1" = --clean ]; then
+    exec ./zdtm/static/cgroupv2_fds.hook "$1"
+fi

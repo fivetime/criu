@@ -1,0 +1,2 @@
+{'flavor': 'h', 'flags': 'suid excl', 'opts': '--manage-cgroups=full',
+ 'dopts': '--cgroup-root :/zdtm-cgroupv2-fds'}

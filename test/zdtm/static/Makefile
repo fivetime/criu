@@ -430,6 +430,8 @@ TST_DIR		=				\
 		mount_paths			\
 		bind-mount			\
 		shared_disjoint_roots		\
+		cgroupv2_fds			\
+		cgroupv2_fds_existing		\
 		shared_mount_propagation	\
 		overmount_with_shared_parent	\
 		inotify00			\

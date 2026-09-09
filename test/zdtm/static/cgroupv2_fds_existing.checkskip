@@ -1,0 +1,2 @@
+#!/bin/sh
+exec ./zdtm/static/cgroupv2_fds.checkskip

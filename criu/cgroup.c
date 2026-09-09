@@ -275,10 +275,14 @@ static inline char *strip(char *str)
 	return str;
 }
 
-/*
- * Currently this function only supports properties that have a string value
- * under 1024 chars.
- */
+static bool cgroup_property_perms_only(const char *name)
+{
+	return !strcmp(name, "cgroup.procs") || !strcmp(name, "tasks") || !strcmp(name, "cgroup.threads") ||
+	       !strcmp(name, "cgroup.events") || !strcmp(name, "cpu.pressure") || !strcmp(name, "io.pressure") ||
+	       !strcmp(name, "memory.pressure") || !strcmp(name, "memory.events") || !strcmp(name, "memory.events.local");
+}
+
+/* Property values must fit in 1024 bytes. */
 static int read_cgroup_prop(struct cgroup_prop *property, const char *fullpath)
 {
 	char buf[1024];
@@ -304,7 +308,7 @@ static int read_cgroup_prop(struct cgroup_prop *property, const char *fullpath)
 
 	/* skip dumping the value of these, since it doesn't make sense (we
 	 * just want to restore the perms) */
-	if (!strcmp(property->name, "cgroup.procs") || !strcmp(property->name, "tasks")) {
+	if (cgroup_property_perms_only(property->name)) {
 		ret = 0;
 		/* libprotobuf segfaults if we leave a null pointer in a
 		 * string, so let's not do that */
@@ -1150,12 +1154,17 @@ static const char *special_props[] = {
 	"memory.oom_control",
 	"memory.use_hierarchy",
 	"cgroup.type",
+	"cgroup.subtree_control",
 	NULL,
 };
 
 bool is_special_property(const char *prop)
 {
 	size_t i = 0;
+
+	/* Guest descriptors can need delegated permissions before tasks resume. */
+	if (cgroup_property_perms_only(prop))
+		return true;
 
 	for (i = 0; special_props[i]; i++)
 		if (strcmp(prop, special_props[i]) == 0)
@@ -1478,7 +1487,9 @@ static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p, char *pat
 
 	pr_info("Restoring cgroup property value [%s] to [%s]\n", cg_prop_entry_p->value, path);
 
-	if (is_subtree_control)
+	if (cgroup_property_perms_only(cg_prop_entry_p->name))
+		flag = O_RDONLY;
+	else if (is_subtree_control)
 		flag = O_RDWR;
 	else
 		flag = O_WRONLY;
@@ -1493,8 +1504,8 @@ static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p, char *pat
 	if (perms && cr_fchperm(fd, perms->uid, perms->gid, perms->mode) < 0)
 		goto out;
 
-	/* skip these two since restoring their values doesn't make sense */
-	if (!strcmp(cg_prop_entry_p->name, "cgroup.procs") || !strcmp(cg_prop_entry_p->name, "tasks")) {
+	/* Membership, counters and pressure samples are not writable settings. */
+	if (cgroup_property_perms_only(cg_prop_entry_p->name)) {
 		exit_code = 0;
 		goto out;
 	}
@@ -1889,6 +1900,16 @@ static int prepare_cgroup_dirs(char **controllers, int n_controllers, char *paux
 
 			if (!(opts.manage_cgroups & CG_MODE_NONE) && prepare_dir_perms(cg, paux, e->dir_perms) < 0)
 				return -1;
+
+			/* Full/props mode also repairs access to files in pre-existing cgroups. */
+			for (j = 0; j < e->n_properties; j++) {
+				CgroupPropEntry *p = e->properties[j];
+
+				if (!cgroup_property_perms_only(p->name) && strcmp(p->name, "cgroup.subtree_control"))
+					continue;
+				if (restore_cgroup_prop(p, paux, off2, false, false) < 0)
+					return -1;
+			}
 		}
 
 		if (prepare_cgroup_dirs(controllers, n_controllers, paux, off2, e->children, e->n_children) < 0)
