@@ -38,11 +38,19 @@ static const char *____criu_global_props____[] = {
 /* cgroup2 global properties */
 // clang-format off
 static const char *____criu_global_props_v2____[] = {
+	"cgroup.type",
 	"cgroup.subtree_control",
 	"cgroup.max.descendants",
 	"cgroup.max.depth",
 	"cgroup.freeze",
-	"cgroup.type",
+	"cgroup.procs",
+	"cgroup.threads",
+	"cgroup.events",
+	"cpu.pressure",
+	"io.pressure",
+	"memory.pressure",
+	"memory.events",
+	"memory.events.local",
 };
 // clang-format on
 

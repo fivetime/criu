@@ -1,0 +1,5 @@
+#!/bin/sh
+case "$1" in --clean|--pre-restore) ;; *) exit 0 ;; esac
+# These are the two cgroups created exclusively by this test.
+rmdir /sys/fs/cgroup/zdtm-cgroupv2-fds/leaf 2>/dev/null || true
+rmdir /sys/fs/cgroup/zdtm-cgroupv2-fds 2>/dev/null || true

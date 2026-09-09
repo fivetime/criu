@@ -1,0 +1,4 @@
+#!/bin/sh
+test -f /sys/fs/cgroup/cgroup.controllers &&
+    grep -qw memory /sys/fs/cgroup/cgroup.subtree_control &&
+    test -f /sys/fs/cgroup/memory.pressure
