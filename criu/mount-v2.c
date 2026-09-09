@@ -67,6 +67,7 @@ static struct sharing_group *alloc_sharing_group(int shared_id, int master_id)
 
 	sg->shared_id = shared_id;
 	sg->master_id = master_id;
+	sg->representative_fd_id = -1;
 
 	INIT_LIST_HEAD(&sg->list);
 	INIT_LIST_HEAD(&sg->mnt_list);
@@ -931,7 +932,7 @@ static int move_mount_set_group(int src_id, char *source, int dst_id)
 	return 0;
 }
 
-static int restore_one_sharing(struct sharing_group *sg, struct mount_info *target)
+static int restore_one_sharing(struct sharing_group *sg, int target_fd_id, int target_nsfd_id, int target_id)
 {
 	int nsfd = -1, orig_nsfd = -1, exit_code = -1;
 	char target_path[PATH_MAX];
@@ -940,19 +941,16 @@ static int restore_one_sharing(struct sharing_group *sg, struct mount_info *targ
 	if (!sg->master_id && !sg->shared_id)
 		return 0;
 
-	target_fd = fdstore_get(target->mnt_fd_id);
+	target_fd = fdstore_get(target_fd_id);
 	BUG_ON(target_fd < 0);
 	snprintf(target_path, sizeof(target_path), "/proc/self/fd/%d", target_fd);
 
 	/* Restore target's master_id from shared_id of the source */
 	if (sg->master_id) {
 		if (sg->parent) {
-			struct mount_info *first;
-
 			/* Get shared_id from parent sharing group */
-			first = get_first_mount(sg->parent);
-			if (move_mount_set_group(first->mnt_fd_id, NULL, target->mnt_fd_id)) {
-				pr_err("Failed to copy sharing from %d to %d\n", first->mnt_id, target->mnt_id);
+			if (move_mount_set_group(sg->parent->representative_fd_id, NULL, target_fd_id)) {
+				pr_err("Failed to copy parent sharing to %d\n", target_id);
 				goto err;
 			}
 		} else {
@@ -963,24 +961,25 @@ static int restore_one_sharing(struct sharing_group *sg, struct mount_info *targ
 			 * or non-shared slave). If source is a private mount
 			 * we would fail.
 			 */
-			if (move_mount_set_group(-1, sg->source, target->mnt_fd_id)) {
-				pr_err("Failed to copy sharing from source %s to %d\n", sg->source, target->mnt_id);
+			if (move_mount_set_group(-1, sg->source, target_fd_id)) {
+				pr_err("Failed to copy sharing from source %s to %d\n", sg->source, target_id);
 				goto err;
 			}
 		}
 	}
 
-	nsfd = fdstore_get(target->nsid->mnt.nsfd_id);
-	if (nsfd < 0)
-		goto err;
-
-	if (switch_ns_by_fd(nsfd, &mnt_ns_desc, &orig_nsfd))
-		goto err;
+	if (target_nsfd_id >= 0) {
+		nsfd = fdstore_get(target_nsfd_id);
+		if (nsfd < 0)
+			goto err;
+		if (switch_ns_by_fd(nsfd, &mnt_ns_desc, &orig_nsfd))
+			goto err;
+	}
 
 	if (sg->master_id) {
 		/* Convert shared_id to master_id */
 		if (mount(NULL, target_path, NULL, MS_SLAVE, NULL)) {
-			pr_perror("Failed to make mount %d slave", target->mnt_id);
+			pr_perror("Failed to make mount %d slave", target_id);
 			goto err;
 		}
 	}
@@ -988,7 +987,7 @@ static int restore_one_sharing(struct sharing_group *sg, struct mount_info *targ
 	/* Restore target's shared_id */
 	if (sg->shared_id) {
 		if (mount(NULL, target_path, NULL, MS_SHARED, NULL)) {
-			pr_perror("Failed to make mount %d shared", target->mnt_id);
+			pr_perror("Failed to make mount %d shared", target_id);
 			goto err;
 		}
 	}
@@ -1001,22 +1000,94 @@ err:
 	return exit_code;
 }
 
+static bool sharing_tree_below(struct sharing_group *sg, char *root)
+{
+	struct sharing_group *child;
+	struct mount_info *mi;
+
+	list_for_each_entry(mi, &sg->mnt_list, mnt_sharing) {
+		if (!is_sub_path(mi->root, root))
+			return false;
+	}
+	list_for_each_entry(child, &sg->children, siblings) {
+		if (!sharing_tree_below(child, root))
+			return false;
+	}
+	return true;
+}
+
+static int create_sharing_representative(struct sharing_group *sg, struct mount_info *first)
+{
+	struct mount_info *mi, *source = NULL;
+	char *path;
+	int fd;
+
+	/* Service mounts are private copies, including roots absent from the peer group. */
+	for (mi = mntinfo; mi; mi = mi->next) {
+		if (mi->s_dev != first->s_dev || mi->s_dev_rt != first->s_dev_rt || !mi->is_dir ||
+		    !sharing_tree_below(sg, mi->root))
+			continue;
+		if (!source || strlen(mi->root) > strlen(source->root))
+			source = mi;
+	}
+	if (!source) {
+		pr_err("No common root for sharing group (%d, %d)\n", sg->shared_id, sg->master_id);
+		return -1;
+	}
+	path = xsprintf("%s/sharing-%d-%d", mnt_roots, sg->shared_id, sg->master_id);
+	if (!path)
+		return -1;
+	if (mkdir(path, 0700)) {
+		pr_perror("Can't create common-root peer mountpoint");
+		xfree(path);
+		return -1;
+	}
+	sg->representative_path = path;
+	if (mount(source->plain_mountpoint, path, NULL, MS_BIND, NULL)) {
+		pr_perror("Can't create common-root sharing peer");
+		return -1;
+	}
+	sg->representative_mounted = true;
+	if (mount(NULL, path, NULL, MS_PRIVATE, NULL)) {
+		pr_perror("Can't make common-root sharing peer private");
+		return -1;
+	}
+	fd = open(sg->representative_path, O_PATH);
+	if (fd < 0) {
+		pr_perror("Can't open common-root sharing peer");
+		return -1;
+	}
+	sg->representative_fd_id = fdstore_add(fd);
+	close(fd);
+	if (sg->representative_fd_id < 0)
+		return -1;
+	pr_debug("Sharing group (%d, %d) uses temporary peer rooted at %s\n", sg->shared_id, sg->master_id,
+		 source->root);
+	return restore_one_sharing(sg, sg->representative_fd_id, -1, first->mnt_id);
+}
+
 static int restore_one_sharing_group(struct sharing_group *sg)
 {
 	struct mount_info *first, *other;
 
 	first = get_first_mount(sg);
 
-	if (restore_one_sharing(sg, first))
-		return -1;
+	if (!sharing_tree_below(sg, first->root) && (sg->parent || sg->shared_id)) {
+		if (create_sharing_representative(sg, first))
+			return -1;
+	} else {
+		sg->representative_fd_id = first->mnt_fd_id;
+		if (restore_one_sharing(sg, first->mnt_fd_id, first->nsid->mnt.nsfd_id, first->mnt_id))
+			return -1;
+	}
 
 	/* Restore sharing for other mounts from the sharing group */
 	list_for_each_entry(other, &sg->mnt_list, mnt_sharing) {
-		if (other == first)
+		if (other == first && !sg->representative_path)
 			continue;
 
-		if (is_sub_path(other->root, first->root)) {
-			if (move_mount_set_group(first->mnt_fd_id, NULL, other->mnt_fd_id)) {
+		if (sg->representative_path || is_sub_path(other->root, first->root)) {
+			if (move_mount_set_group(sg->representative_fd_id, NULL, other->mnt_fd_id)) {
 				pr_err("Failed to copy sharing from %d to %d\n", first->mnt_id, other->mnt_id);
 				return -1;
 			}
@@ -1037,7 +1108,7 @@ static int restore_one_sharing_group(struct sharing_group *sg)
 			 * This is a w/a runc usecase, see https://github.com/opencontainers/runc/pull/3442
 			 */
 			if (!sg->parent && !sg->shared_id) {
-				if (restore_one_sharing(sg, other))
+				if (restore_one_sharing(sg, other->mnt_fd_id, other->nsid->mnt.nsfd_id, other->mnt_id))
 					return -1;
 			} else {
 				pr_err("Can't copy sharing from %d[%s] to %d[%s]\n", first->mnt_id, first->root,
@@ -1068,6 +1139,7 @@ static struct sharing_group *sharing_group_next(struct sharing_group *sg)
 static int restore_mount_sharing_options(void)
 {
 	struct sharing_group *sg;
+	int ret = -1;
 
 	list_for_each_entry(sg, &sharing_groups, list) {
 		struct sharing_group *t;
@@ -1078,11 +1150,26 @@ static int restore_mount_sharing_options(void)
 		/* Handle dependent sharing groups in tree order */
 		for (t = sg; t != NULL; t = sharing_group_next(t)) {
 			if (restore_one_sharing_group(t))
-				return -1;
+				goto out;
 		}
 	}
-
-	return 0;
+	ret = 0;
+out:
+	list_for_each_entry(sg, &sharing_groups, list) {
+		if (!sg->representative_path)
+			continue;
+		/* fdstore still pins this peer; detach it after removing its propagation links. */
+		if ((sg->representative_mounted &&
+		     (mount(NULL, sg->representative_path, NULL, MS_PRIVATE, NULL) ||
+		      umount2(sg->representative_path, MNT_DETACH))) ||
+		    rmdir(sg->representative_path)) {
+			pr_perror("Can't remove common-root sharing peer %s", sg->representative_path);
+			ret = -1;
+		}
+		xfree(sg->representative_path);
+		sg->representative_path = NULL;
+	}
+	return ret;
 }
 
 static int remove_source_of_deleted_mount(struct mount_info *mi)

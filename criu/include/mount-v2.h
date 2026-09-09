@@ -1,6 +1,8 @@
 #ifndef __CR_MOUNT_V2_H__
 #define __CR_MOUNT_V2_H__
 
+#include <stdbool.h>
+
 #include "linux/mount.h"
 #include "linux/openat2.h"
 
@@ -87,6 +89,11 @@ struct sharing_group {
 	struct sharing_group *parent;
 
 	char *source;
+
+	/* Temporary common-root peer, when no restored peer covers the group. */
+	int representative_fd_id;
+	char *representative_path;
+	bool representative_mounted;
 };
 
 extern int resolve_shared_mounts_v2(void);
