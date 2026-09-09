@@ -435,6 +435,7 @@ TST_DIR		=				\
 		mnt_ro_bind			\
 		mount_paths			\
 		bind-mount			\
+		shared_disjoint_roots		\
 		shared_mount_propagation	\
 		overmount_with_shared_parent	\
 		inotify00			\
