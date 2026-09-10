@@ -150,6 +150,7 @@ TST_NOFILE	:=				\
 		sock_ip_opts01			\
 		sock_tcp_opts00			\
 		sock_tcp_opts01			\
+		sock_uid				\
 		sk-unix-unconn			\
 		sk-unix-unconn-seqpacket	\
 		ipc_namespace			\
@@ -366,6 +367,7 @@ TST_FILE	=				\
 		fifo				\
 		fifo-ghost			\
 		fifo_ro				\
+		fifo_ro_nonblock		\
 		fifo_wronly			\
 		console				\
 		vt				\
