@@ -2105,7 +2105,7 @@ static int restore_cgroup_access(char *path, size_t off, CgroupDirEntry **ents, 
 
 			if (!cgroup_property_perms_only(p->name) && strcmp(p->name, "cgroup.subtree_control"))
 				continue;
-			if (restore_cgroup_prop(p, path, off2, false, false) < 0)
+			if (restore_cgroup_prop(p, path, PATH_MAX, off2, false, false) < 0)
 				return -1;
 		}
 		if (restore_cgroup_access(path, off2, e->children, e->n_children) < 0)
