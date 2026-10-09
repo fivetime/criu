@@ -56,6 +56,7 @@
 #include "crtools.h"
 #include "uffd.h"
 #include "namespaces.h"
+#include "uts_ns.h"
 #include "asyncd.h"
 #include "compression.h"
 #include "mem.h"
@@ -1653,6 +1654,9 @@ static int __restore_task_with_children(void *_arg)
 	}
 
 	if (setup_newborn_fds(current))
+		goto err;
+
+	if (restore_task_uts_ns(current))
 		goto err;
 
 	if (restore_task_mnt_ns(current))

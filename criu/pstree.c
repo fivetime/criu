@@ -9,6 +9,7 @@
 #include "rst-malloc.h"
 #include "common/lock.h"
 #include "namespaces.h"
+#include "uts_ns.h"
 #include "files.h"
 #include "tty.h"
 #include "mount.h"
@@ -536,6 +537,10 @@ static int read_pstree_ids(struct pstree_item *pi)
 		if (rst_add_ns_id(pi->ids->net_ns_id, pi, &net_ns_desc))
 			return -1;
 	}
+	if (pi->ids->has_uts_ns_id) {
+		if (rst_add_ns_id(pi->ids->uts_ns_id, pi, &uts_ns_desc))
+			return -1;
+	}
 	if (pi->ids->has_pid_ns_id) {
 		if (rst_add_ns_id(pi->ids->pid_ns_id, pi, &pid_ns_desc))
 			return -1;
@@ -936,8 +941,7 @@ static int prepare_pstree_kobj_ids(void)
 		rsti(item)->clone_flags = cflags;
 		if (parent)
 			/*
-			 * Mount namespaces are setns()-ed at
-			 * restore_task_mnt_ns() explicitly,
+			 * Mount and UTS namespaces are setns()-ed explicitly,
 			 * no need in creating it with its own
 			 * temporary namespace.
 			 *
@@ -946,7 +950,7 @@ static int prepare_pstree_kobj_ids(void)
 			 * which will be populated with all other
 			 * namespaces' entries.
 			 */
-			rsti(item)->clone_flags &= ~CLONE_NEWNS;
+			rsti(item)->clone_flags &= ~(CLONE_NEWNS | CLONE_NEWUTS);
 
 		/**
 		 * Only child reaper can clone with CLONE_NEWPID

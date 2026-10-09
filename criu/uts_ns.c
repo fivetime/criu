@@ -8,6 +8,8 @@
 #include "namespaces.h"
 #include "sysctl.h"
 #include "uts_ns.h"
+#include "fdstore.h"
+#include "pstree.h"
 
 #include "protobuf.h"
 #include "images/utsns.pb-c.h"
@@ -69,3 +71,70 @@ out:
 }
 
 struct ns_desc uts_ns_desc = NS_DESC_ENTRY(CLONE_NEWUTS, "uts");
+
+static int create_uts_namespaces(void *unused)
+{
+	struct ns_id *ns;
+	int root_fd, fd, ret = -1;
+
+	root_fd = open_proc(PROC_SELF, "ns/uts");
+	if (root_fd < 0)
+		return -1;
+
+	for (ns = ns_ids; ns; ns = ns->next) {
+		if (ns->nd != &uts_ns_desc)
+			continue;
+		if (ns->type == NS_ROOT) {
+			fd = dup(root_fd);
+		} else {
+			if (unshare(CLONE_NEWUTS)) {
+				pr_perror("Unable to create UTS namespace %u", ns->id);
+				goto out;
+			}
+			if (prepare_utsns(ns->id))
+				goto out;
+			fd = open_proc(PROC_SELF, "ns/uts");
+		}
+		if (fd < 0)
+			goto out;
+		ns->uts.nsfd_id = fdstore_add(fd);
+		close(fd);
+		if (ns->uts.nsfd_id < 0)
+			goto out;
+	}
+	ret = 0;
+out:
+	close(root_fd);
+	return ret;
+}
+
+int prepare_uts_namespaces(void)
+{
+	if (!(root_ns_mask & CLONE_NEWUTS))
+		return 0;
+
+	/* Keep the root task in its own UTS namespace while preparing peers. */
+	return call_in_child_process(create_uts_namespaces, NULL);
+}
+
+int restore_task_uts_ns(struct pstree_item *item)
+{
+	struct ns_id *ns;
+	int fd, ret;
+
+	if (!(root_ns_mask & CLONE_NEWUTS) || !item->ids || !item->ids->has_uts_ns_id)
+		return 0;
+	ns = lookup_ns_by_id(item->ids->uts_ns_id, &uts_ns_desc);
+	if (!ns) {
+		pr_err("Missing UTS namespace %u\n", item->ids->uts_ns_id);
+		return -1;
+	}
+	fd = fdstore_get(ns->uts.nsfd_id);
+	if (fd < 0)
+		return -1;
+	ret = setns(fd, CLONE_NEWUTS);
+	if (ret)
+		pr_perror("Unable to join UTS namespace %u", ns->id);
+	close(fd);
+	return ret;
+}

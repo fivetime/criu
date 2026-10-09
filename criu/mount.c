@@ -21,6 +21,7 @@
 #include "pstree.h"
 #include "image.h"
 #include "namespaces.h"
+#include "cgroup.h"
 #include "protobuf.h"
 #include "fs-magic.h"
 #include "path.h"
@@ -1772,8 +1773,20 @@ static void free_mntinfo(struct mount_info *pms)
 struct mount_info *collect_mntinfo(struct ns_id *ns, bool for_dump)
 {
 	struct mount_info *pm;
+	int cgroup_ns = -1;
 
+	/* Cgroup mount roots are rendered relative to the reader's cgroup
+	 * namespace. Read them in the dumped namespace instead of replacing
+	 * every root with "/", which loses bind-mounted files and subtrees.
+	 */
+	if (for_dump && ns->type != NS_CRIU && (root_ns_mask & CLONE_NEWCGROUP) &&
+	    switch_ns(ns->ns_pid, &cgroup_ns_desc, &cgroup_ns))
+		return NULL;
 	pm = parse_mountinfo(ns->ns_pid, ns, for_dump);
+	if (cgroup_ns >= 0 && restore_ns(cgroup_ns, &cgroup_ns_desc)) {
+		free_mntinfo(pm);
+		return NULL;
+	}
 	if (!pm) {
 		pr_err("Can't parse %d's mountinfo\n", ns->ns_pid);
 		return NULL;

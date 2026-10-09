@@ -1,0 +1,2 @@
+#!/bin/sh
+test -f /sys/fs/cgroup/cgroup.controllers && test -f /sys/fs/cgroup/memory.pressure

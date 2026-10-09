@@ -573,6 +573,8 @@ static int open_ns_fd(struct file_desc *d, int *new_fd)
 		/* Check for CLONE_XXX as we use fdstore only if flag is set */
 		if (ns->nd == &net_ns_desc && (root_ns_mask & CLONE_NEWNET))
 			nsfd_id = ns->net.nsfd_id;
+		else if (ns->nd == &uts_ns_desc && (root_ns_mask & CLONE_NEWUTS))
+			nsfd_id = ns->uts.nsfd_id;
 		else
 			break;
 		fd = fdstore_get(nsfd_id);
@@ -1872,6 +1874,8 @@ int prepare_namespace(struct pstree_item *item, unsigned long clone_flags)
 
 	id = ns_per_id ? item->ids->uts_ns_id : pid;
 	if ((clone_flags & CLONE_NEWUTS) && prepare_utsns(id))
+		goto out;
+	if (prepare_uts_namespaces())
 		goto out;
 	id = ns_per_id ? item->ids->ipc_ns_id : pid;
 	if ((clone_flags & CLONE_NEWIPC) && prepare_ipc_ns(id))

@@ -90,6 +90,7 @@ TST_NOFILE	:=				\
 		vdso02				\
 		vdso-proxy			\
 		utsname				\
+		utsname_subns			\
 		pstree				\
 		sockets01			\
 		sockets01-seqpacket		\
@@ -439,6 +440,7 @@ TST_DIR		=				\
 		cgroupv2_fds			\
 		cgroupv2_fds_existing		\
 		cgroupv2_fds_namespace		\
+		cgroupv2_file_bind		\
 		shared_mount_propagation	\
 		overmount_with_shared_parent	\
 		inotify00			\

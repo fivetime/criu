@@ -643,28 +643,10 @@ static int tracefs_parse(struct mount_info *pm)
 
 static bool cgroup_sb_equal(struct mount_info *a, struct mount_info *b)
 {
-	if (a->private && b->private && strcmp(a->private, b->private))
-		return false;
 	if (strcmp(a->options, b->options))
 		return false;
 
 	return true;
-}
-
-static int cgroup_parse(struct mount_info *pm)
-{
-	if (!(root_ns_mask & CLONE_NEWCGROUP))
-		return 0;
-
-	/* cgroup namespaced mounts don't look rooted to CRIU, so let's fake it
-	 * here.
-	 */
-	pm->private = pm->root;
-	pm->root = xstrdup("/");
-	if (!pm->root)
-		return -1;
-
-	return 0;
 }
 
 static bool btrfs_sb_equal(struct mount_info *a, struct mount_info *b)
@@ -809,13 +791,11 @@ static struct fstype fstypes[] = {
 	{
 		.name = "cgroup",
 		.code = FSTYPE__CGROUP,
-		.parse = cgroup_parse,
 		.sb_equal = cgroup_sb_equal,
 	},
 	{
 		.name = "cgroup2",
 		.code = FSTYPE__CGROUP2,
-		.parse = cgroup_parse,
 		.sb_equal = cgroup_sb_equal,
 	},
 	{
