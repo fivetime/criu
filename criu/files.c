@@ -495,6 +495,62 @@ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
 	return err;
 }
 
+static int check_psi_fd(const struct fd_parms *p)
+{
+	struct mount_info *mi;
+	char path[PATH_MAX], *relative, *name;
+	size_t len;
+	int ret;
+	bool pressure;
+
+	if (!S_ISREG(p->stat.st_mode) || (p->flags & O_PATH) ||
+	    ((p->flags & O_ACCMODE) != O_WRONLY && (p->flags & O_ACCMODE) != O_RDWR) ||
+	    (p->fs_type != PROC_SUPER_MAGIC && p->fs_type != CGROUP2_SUPER_MAGIC))
+		return 0;
+
+	/* A PSI trigger belongs to the open file description, not to its path.
+	 * The kernel has no interface to export it. Even an apparently unarmed
+	 * writable descriptor must be rejected: position, poll and environment
+	 * variables cannot establish the trigger state without changing it.
+	 * Resolve the filesystem path so file and directory bind aliases cannot
+	 * disguise a pressure file as an ordinary regular file.
+	 */
+	mi = lookup_mnt_id(p->mnt_id);
+	if (!mi || !(relative = get_relative_path(p->link->name, mi->ns_mountpoint))) {
+		pr_err("Cannot resolve writable proc/cgroup fd for PSI check: pid=%d fd=%d mount=%d path=%s\n",
+		       p->pid, p->fd, p->mnt_id, p->link->name + 1);
+		return -1;
+	}
+
+	len = strlen(mi->root);
+	ret = snprintf(path, sizeof(path), "%s%s%s", mi->root,
+		       *relative && len && mi->root[len - 1] != '/' ? "/" : "", relative);
+	if (ret < 0 || (size_t)ret >= sizeof(path)) {
+		pr_err("PSI filesystem path is too long: pid=%d fd=%d\n", p->pid, p->fd);
+		return -1;
+	}
+	len = strlen(path);
+	if (len >= strlen(" (deleted)") && !strcmp(path + len - strlen(" (deleted)"), " (deleted)"))
+		path[len - strlen(" (deleted)")] = '\0';
+
+	if (p->fs_type == CGROUP2_SUPER_MAGIC) {
+		name = strrchr(path, '/');
+		name = name ? name + 1 : path;
+		pressure = !strcmp(name, "cpu.pressure") || !strcmp(name, "memory.pressure") ||
+			   !strcmp(name, "io.pressure") || !strcmp(name, "irq.pressure");
+	} else {
+		pressure = !strcmp(path, "/pressure/cpu") || !strcmp(path, "/pressure/memory") ||
+			   !strcmp(path, "/pressure/io") || !strcmp(path, "/pressure/irq");
+	}
+	if (!pressure)
+		return 0;
+
+	pr_err("Unsupported writable PSI descriptor: pid=%d fd=%d path=%s; "
+	       "kernel PSI trigger state cannot be checkpointed\n", p->pid, p->fd, path);
+	errno = EOPNOTSUPP;
+	return -1;
+}
+
 static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts, struct parasite_ctl *ctl,
 			 FdinfoEntry *e, struct parasite_drain_fd *dfds)
 {
@@ -567,6 +623,9 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			return -1;
 
 		p.link = &link;
+		/* Before deduplication, external-file handling, or plugin dispatch. */
+		if (check_psi_fd(&p))
+			return -1;
 
 		/* TODO: Dump for hugetlb fd when memfd hugetlb is not supported */
 		if (is_memfd(p.stat.st_dev) || (kdat.has_memfd_hugetlb && is_hugetlb_dev(p.stat.st_dev, NULL)))

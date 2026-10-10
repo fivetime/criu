@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
-#include <ftw.h>
+#include <dirent.h>
 #include <libgen.h>
 #include <sched.h>
 #include <sys/wait.h>
@@ -234,8 +234,7 @@ static bool cgroup_contains(char **controllers, unsigned int n_controllers, char
 	return all_match && n_controllers > 0;
 }
 
-/* This is for use in add_cgroup() as additional arguments for the ftw()
- * callback */
+/* Context shared while collecting one controller hierarchy. */
 static struct cg_controller *current_controller;
 static unsigned int path_pref_len;
 
@@ -478,65 +477,65 @@ static int add_cgroup_properties(const char *fpath, struct cgroup_dir *ncd, stru
 	return 0;
 }
 
-static int add_cgroup(const char *fpath, const struct stat *sb, int typeflag)
+static int add_cgroup(const char *fpath, const struct stat *sb, int fd)
 {
 	struct cgroup_dir *ncd = NULL, *match;
 	int exit_code = -1;
+	char property_path[64];
+	int mtype;
 
-	if (typeflag == FTW_D) {
-		int mtype;
+	snprintf(property_path, sizeof(property_path), "/proc/self/fd/%d", fd);
 
-		pr_info("adding cgroup %s\n", fpath);
+	pr_info("adding cgroup %s\n", fpath);
 
-		ncd = xmalloc(sizeof(*ncd));
-		if (!ncd)
-			goto out;
+	ncd = xmalloc(sizeof(*ncd));
+	if (!ncd)
+		goto out;
 
-		ncd->mode = sb->st_mode;
-		ncd->uid = sb->st_uid;
-		ncd->gid = sb->st_gid;
+	ncd->mode = sb->st_mode;
+	ncd->uid = sb->st_uid;
+	ncd->gid = sb->st_gid;
 
-		/* chop off the first "/proc/self/fd/N" str */
-		if (fpath[path_pref_len] == '\0')
-			ncd->path = xstrdup("/");
-		else
-			ncd->path = xstrdup(fpath + path_pref_len);
+	/* chop off the first "/proc/self/fd/N" str */
+	if (fpath[path_pref_len] == '\0')
+		ncd->path = xstrdup("/");
+	else
+		ncd->path = xstrdup(fpath + path_pref_len);
 
-		if (!ncd->path)
-			goto out;
+	if (!ncd->path)
+		goto out;
 
-		mtype = find_dir(ncd->path, &current_controller->heads, &match);
+	mtype = find_dir(ncd->path, &current_controller->heads, &match);
 
-		switch (mtype) {
-		/* ignore co-mounted cgroups and already dumped cgroups */
-		case EXACT_MATCH:
-			exit_code = 0;
-			goto out;
-		case PARENT_MATCH:
-			list_add_tail(&ncd->siblings, &match->children);
-			match->n_children++;
-			break;
-		case NO_MATCH:
-			list_add_tail(&ncd->siblings, &current_controller->heads);
-			current_controller->n_heads++;
-			break;
-		default:
-			BUG();
-		}
+	switch (mtype) {
+	/* ignore co-mounted cgroups and already dumped cgroups */
+	case EXACT_MATCH:
+		exit_code = 0;
+		goto out;
+	case PARENT_MATCH:
+		list_add_tail(&ncd->siblings, &match->children);
+		match->n_children++;
+		break;
+	case NO_MATCH:
+		list_add_tail(&ncd->siblings, &current_controller->heads);
+		current_controller->n_heads++;
+		break;
+	default:
+		BUG();
+	}
 
-		INIT_LIST_HEAD(&ncd->children);
-		ncd->n_children = 0;
+	INIT_LIST_HEAD(&ncd->children);
+	ncd->n_children = 0;
 
-		INIT_LIST_HEAD(&ncd->properties);
-		ncd->n_properties = 0;
-		if (add_cgroup_properties(fpath, ncd, current_controller) < 0) {
-			list_del(&ncd->siblings);
-			if (mtype == PARENT_MATCH)
-				match->n_children--;
-			else if (mtype == NO_MATCH)
-				current_controller->n_heads--;
-			goto out;
-		}
+	INIT_LIST_HEAD(&ncd->properties);
+	ncd->n_properties = 0;
+	if (add_cgroup_properties(property_path, ncd, current_controller) < 0) {
+		list_del(&ncd->siblings);
+		if (mtype == PARENT_MATCH)
+			match->n_children--;
+		else if (mtype == NO_MATCH)
+			current_controller->n_heads--;
+		goto out;
 	}
 
 	return 0;
@@ -546,6 +545,85 @@ out:
 		xfree(ncd->path);
 	xfree(ncd);
 	return exit_code;
+}
+
+/*
+ * Own @fd until return. Unlike ftw(), the walk must not silently stop at the
+ * supplied open-file budget on musl. Keep each directory pinned while reading
+ * its children and fail the dump if a directory cannot be completely read.
+ * Only @path is shared across recursive calls; no PATH_MAX-sized stack frames.
+ */
+static int collect_cgroup_tree(int fd, char *path, size_t path_len)
+{
+	struct dirent *de;
+	struct stat st;
+	DIR *dir;
+	int ret = -1, saved_errno;
+
+	if (fd < 0)
+		return -1;
+
+	dir = fdopendir(fd);
+	if (!dir) {
+		saved_errno = errno;
+		close(fd);
+		errno = saved_errno;
+		return -1;
+	}
+
+	if (fstat(fd, &st) < 0 || add_cgroup(path, &st, fd) < 0)
+		goto out;
+
+	while (1) {
+		struct stat child_st;
+		int child_fd, len;
+
+		errno = 0;
+		de = readdir(dir);
+		if (!de) {
+			if (!errno)
+				ret = 0;
+			break;
+		}
+		if (dir_dots(de))
+			continue;
+		if (fstatat(fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0)
+			break;
+		if (!S_ISDIR(st.st_mode))
+			continue;
+		len = snprintf(path + path_len, PATH_MAX - path_len, "%s%s",
+			       path[path_len - 1] == '/' ? "" : "/", de->d_name);
+		if (len < 0 || (size_t)len >= PATH_MAX - path_len) {
+			errno = ENAMETOOLONG;
+			break;
+		}
+
+		child_fd = openat(fd, de->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (child_fd < 0)
+			break;
+		if (fstat(child_fd, &child_st) < 0) {
+			saved_errno = errno;
+			close(child_fd);
+			errno = saved_errno;
+			break;
+		}
+		if (st.st_dev != child_st.st_dev || st.st_ino != child_st.st_ino) {
+			close(child_fd);
+			errno = ESTALE;
+			break;
+		}
+		if (collect_cgroup_tree(child_fd, path, strlen(path)) < 0)
+			break;
+		path[path_len] = '\0';
+	}
+
+out:
+	saved_errno = errno;
+	path[path_len] = '\0';
+	if (closedir(dir) < 0 && ret == 0)
+		return -1;
+	errno = saved_errno;
+	return ret;
 }
 
 static int add_freezer_state(struct cg_controller *controller)
@@ -834,7 +912,10 @@ static int collect_cgroups(struct list_head *ctls)
 			return -1;
 		}
 
-		ret = ftw(path, add_cgroup, 4);
+		while (*root == '/')
+			root++;
+		ret = collect_cgroup_tree(openat(fd, *root ? root : ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC),
+					  path, strlen(path));
 
 		if (ret < 0)
 			pr_perror("failed walking %s for empty cgroups", path);

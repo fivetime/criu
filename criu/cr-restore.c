@@ -376,6 +376,10 @@ static int root_prepare_shared(void)
 	if (ret)
 		goto err;
 
+	ret = unix_rebind_scms();
+	if (ret)
+		goto err;
+
 	ret = unix_prepare_root_shared();
 	if (ret)
 		goto err;
@@ -2574,6 +2578,8 @@ static int prepare_mm(pid_t pid, struct task_restore_args *args)
 {
 	int exe_fd, i, ret = -1;
 	MmEntry *mm = rsti(current)->mm;
+	struct file_desc *exe_file;
+	u32 exe_flags = O_RDONLY;
 
 	args->mm = *mm;
 	args->mm.n_mm_saved_auxv = 0;
@@ -2589,7 +2595,18 @@ static int prepare_mm(pid_t pid, struct task_restore_args *args)
 		args->mm_saved_auxv[i] = (auxv_t)mm->mm_saved_auxv[i];
 	}
 
-	exe_fd = open_reg_by_id(mm->exe_file_id);
+	exe_file = find_file_desc_raw(FD_TYPES__REG, mm->exe_file_id);
+	if (!exe_file) {
+		pr_err("Can't find executable file %#x\n", mm->exe_file_id);
+		goto out;
+	}
+
+	/*
+	 * The special-file ID may reuse a guest O_PATH descriptor for the
+	 * executable. PR_SET_MM_MAP needs a regular readable descriptor, while
+	 * the guest's original descriptor must retain its own open flags.
+	 */
+	exe_fd = open_path(exe_file, do_open_reg_noseek_flags, &exe_flags);
 	if (exe_fd < 0)
 		goto out;
 

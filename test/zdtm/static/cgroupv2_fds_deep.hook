@@ -1,0 +1,11 @@
+#!/bin/sh
+case "$1" in --clean|--pre-restore) ;; *) exit 0 ;; esac
+# Remove only this test's empty branch, deepest directory first.
+path=/sys/fs/cgroup/zdtm-cgroupv2-fds/user.slice/user-1000.slice/user@1000.service/app.slice/dbus.socket
+while [ "$path" != /sys/fs/cgroup/zdtm-cgroupv2-fds ]; do
+    if [ -d "$path" ]; then
+        rmdir "$path" || exit 1
+    fi
+    path=${path%/*}
+done
+exec "$(dirname "$0")/cgroupv2_fds.hook" "$@"
