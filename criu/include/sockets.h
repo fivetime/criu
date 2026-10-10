@@ -44,6 +44,7 @@ extern int add_fake_unix_queuers_finish(void);
 extern int fix_external_unix_sockets(void);
 extern int prepare_scms(void);
 extern int unix_note_scm_rights(int id_for, uint32_t *file_ids, int *fds, int n_ids);
+extern int unix_rebind_scms(void);
 
 extern struct collect_image_info netlink_sk_cinfo;
 

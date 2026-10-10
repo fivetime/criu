@@ -1014,6 +1014,7 @@ struct unix_sk_info {
 struct scm_fle {
 	struct list_head l;
 	struct fdinfo_list_entry *fle;
+	int *fd;
 };
 
 #define USK_PAIR_MASTER	  0x1
@@ -1179,9 +1180,50 @@ int unix_note_scm_rights(int id_for, uint32_t *file_ids, int *fds, int n_ids)
 		}
 
 		list_add_tail(&sfle->l, &ui->scm_fles);
-		fds[i] = sfle->fle->fe->fd;
+		sfle->fd = &fds[i];
+		*sfle->fd = sfle->fle->fe->fd;
 	}
 
+	return 0;
+}
+
+int unix_rebind_scms(void)
+{
+	struct unix_sk_info *ui;
+	struct scm_fle *sf;
+
+	/*
+	 * Post-prepare may move a socketpair's masters into one task. The
+	 * queued rights must use that task's descriptors, not the numbers
+	 * allocated by prepare_scms() in the original sender.
+	 */
+	list_for_each_entry(ui, &unix_sockets, list) {
+		struct pstree_item *owner;
+
+		if (list_empty(&ui->scm_fles))
+			continue;
+		owner = file_master(&ui->d)->task;
+		list_for_each_entry(sf, &ui->scm_fles, l) {
+			struct file_desc *tgt = sf->fle->desc;
+			struct fdinfo_list_entry *master = file_master(tgt);
+			struct fdinfo_list_entry *fle;
+
+			if (sf->fle->task == owner)
+				continue;
+			fle = get_fle_for_task(tgt, owner, false);
+			if (!fle)
+				return -1;
+			/*
+			 * Keep the opener chosen by post-prepare. A lower-PID new
+			 * user must receive the file from it, not become a master
+			 * with different credentials or invalidate pipe/tty setup.
+			 */
+			list_move(&master->desc_list, &tgt->fd_info_head);
+			sf->fle = fle;
+			*sf->fd = fle->fe->fd;
+			pr_info("scm: rebind file %#x -> %d fd %d\n", tgt->id, vpid(owner), *sf->fd);
+		}
+	}
 	return 0;
 }
 
@@ -1714,7 +1756,7 @@ static int post_open_interconnected_master(struct unix_sk_info *ui)
 	BUG_ON(fle->task != fle_peer->task); /* See interconnected_pair() */
 
 	if (chk_restored_scms(ui) || chk_restored_scms(peer))
-		return 0;
+		return 1;
 
 	if (restore_unix_queue(fle->fe->fd, peer))
 		return -1;

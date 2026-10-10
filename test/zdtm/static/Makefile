@@ -158,6 +158,7 @@ TST_NOFILE	:=				\
 		sk-unix-unconn-seqpacket	\
 		ipc_namespace			\
 		selfexe00			\
+		selfexe_opath			\
 		sem				\
 		maps01				\
 		maps02				\
@@ -239,6 +240,7 @@ TST_NOFILE	:=				\
 		scm08				\
 		scm09				\
 		scm10				\
+		scm11				\
 		aio00				\
 		aio01				\
 		fd				\
@@ -440,6 +442,7 @@ TST_DIR		=				\
 		cgroupv2_fds			\
 		cgroupv2_fds_existing		\
 		cgroupv2_fds_namespace		\
+		cgroupv2_fds_deep			\
 		cgroupv2_file_bind		\
 		shared_mount_propagation	\
 		overmount_with_shared_parent	\
