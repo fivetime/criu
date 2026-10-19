@@ -183,6 +183,7 @@ TST_NOFILE	:=				\
 		uptime_grow			\
 		session00			\
 		rlimits00			\
+		rlimits01			\
 		pty00				\
 		pty01				\
 		pty-console			\
