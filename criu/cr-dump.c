@@ -1000,7 +1000,8 @@ static int dump_signal_queue(pid_t tid, SignalQueueEntry **sqe, bool group)
 	signal_queue_entry__init(queue);
 
 	while (1) {
-		int nr, si_pos;
+		SiginfoEntry **signals;
+		int nr, i;
 		siginfo_t *si;
 
 		si = xmalloc(SI_BATCH * sizeof(*si));
@@ -1026,18 +1027,18 @@ static int dump_signal_queue(pid_t tid, SignalQueueEntry **sqe, bool group)
 			break;
 		}
 
-		queue->n_signals += nr;
-		queue->signals = xrealloc(queue->signals, sizeof(*queue->signals) * queue->n_signals);
-		if (!queue->signals) {
+		signals = xrealloc(queue->signals, sizeof(*queue->signals) * (queue->n_signals + nr));
+		if (!signals) {
 			ret = -1;
 			xfree(si);
 			break;
 		}
+		queue->signals = signals;
 
-		for (si_pos = queue->n_signals - nr; si_pos < queue->n_signals; si_pos++) {
+		for (i = 0; i < nr; i++) {
 			SiginfoEntry *se;
 
-			se = xmalloc(sizeof(*se));
+			se = xmalloc(sizeof(*se) + sizeof(siginfo_t));
 			if (!se) {
 				ret = -1;
 				break;
@@ -1045,12 +1046,12 @@ static int dump_signal_queue(pid_t tid, SignalQueueEntry **sqe, bool group)
 
 			siginfo_entry__init(se);
 			se->siginfo.len = sizeof(siginfo_t);
-			se->siginfo.data = (void *)si++; /* XXX we don't free cores, but when
-							  * we will, this would cause problems
-							  */
-			queue->signals[si_pos] = se;
+			se->siginfo.data = (void *)(se + 1);
+			memcpy(se->siginfo.data, &si[i], sizeof(siginfo_t));
+			queue->signals[queue->n_signals++] = se;
 		}
 
+		xfree(si);
 		if (ret < 0)
 			break;
 
@@ -1677,7 +1678,8 @@ static void alarm_handler(int signo)
 static int setup_alarm_handler(void)
 {
 	struct sigaction sa = {
-		.sa_handler = alarm_handler, .sa_flags = 0, /* Don't restart syscalls */
+		.sa_handler = alarm_handler,
+		.sa_flags = 0, /* Don't restart syscalls */
 	};
 
 	sigemptyset(&sa.sa_mask);
