@@ -540,6 +540,9 @@ class zdtm_test:
             if self.__flavor.uns:
                 env['ZDTM_USERNS'] = "1"
                 self.__add_wperms()
+            if test_flag(self.__desc, 'cgroupns'):
+                # The test's .hook removes this cgroup on --clean.
+                env['ZDTM_CGROUPNS'] = "zdtm-cgroupns-" + os.path.basename(self.__name)
             if os.getenv("GCOV"):
                 criu_dir = os.path.dirname(os.getcwd())
                 criu_dir_r = "%s%s" % (self.__flavor.root, criu_dir)
