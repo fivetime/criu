@@ -53,7 +53,7 @@ static int check_full(void)
 	}
 
 	if (errno != EMFILE) {
-		fail("open() failed with %d, not EMFILE", errno);
+		fail("open() did not fail with EMFILE");
 		return -1;
 	}
 

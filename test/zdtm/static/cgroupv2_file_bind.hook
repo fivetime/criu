@@ -1,7 +1,8 @@
 #!/bin/sh
 case "$1" in --clean|--pre-restore) ;; *) exit 0 ;; esac
-# This empty cgroup belongs exclusively to the suid/exclusive test.
-path=/sys/fs/cgroup/zdtm-cgroupv2-file-bind
+# The cgroup namespace root that zdtm made for the 'cgroupns' flag; it is
+# empty once the test is dead, and --manage-cgroups=full recreates it.
+path=/sys/fs/cgroup/zdtm-cgroupns-cgroupv2_file_bind
 if [ -d "$path" ]; then
 	rmdir "$path"
 fi

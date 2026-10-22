@@ -22,6 +22,10 @@
 #include "zdtmtst.h"
 #include "ns.h"
 
+#ifndef CLONE_NEWCGROUP
+#define CLONE_NEWCGROUP 0x02000000
+#endif
+
 int criu_status_in = -1, criu_status_in_peer = -1, criu_status_out = -1;
 
 extern int pivot_root(const char *new_root, const char *put_old);
@@ -270,11 +274,46 @@ static inline int _settime(clockid_t clk_id, time_t offset)
 	return 0;
 }
 
+/*
+ * Give the namespace init its own cgroup namespace rooted at a dedicated
+ * cgroup, as a container runtime does, so that the dumped tree reads cgroup
+ * mount roots differently from CRIU. Done before pivot_root, while the
+ * host's /sys/fs/cgroup is still reachable.
+ */
+static int create_cgroupns(const char *name)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s", name);
+	if (mkdir(path, 0755) && errno != EEXIST) {
+		fprintf(stderr, "mkdir(%s) failed: %m\n", path);
+		return -1;
+	}
+	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/cgroup.procs", name);
+	fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		fprintf(stderr, "open(%s) failed: %m\n", path);
+		return -1;
+	}
+	if (write(fd, "0", 1) != 1) {
+		fprintf(stderr, "write(%s) failed: %m\n", path);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	if (unshare(CLONE_NEWCGROUP)) {
+		fprintf(stderr, "unshare(CLONE_NEWCGROUP) failed: %m\n");
+		return -1;
+	}
+	return 0;
+}
+
 #define STATUS_FD 255
 static int ns_exec(void *_arg)
 {
 	struct ns_exec_args *args = (struct ns_exec_args *)_arg;
-	char buf[4096];
+	char buf[4096], *cgroupns;
 	int ret;
 
 	close(args->status_pipe[0]);
@@ -290,6 +329,10 @@ static int ns_exec(void *_arg)
 	close(args->status_pipe[1]);
 	read(STATUS_FD, buf, sizeof(buf));
 	shutdown(STATUS_FD, SHUT_RD);
+
+	cgroupns = getenv("ZDTM_CGROUPNS");
+	if (cgroupns && create_cgroupns(cgroupns))
+		return -1;
 
 	if (prepare_namespaces())
 		return -1;

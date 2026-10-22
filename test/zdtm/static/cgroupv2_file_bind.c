@@ -1,6 +1,5 @@
 #include <fcntl.h>
 #include <limits.h>
-#include <sched.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -14,24 +13,22 @@ const char *test_author = "CRIU contributors";
 char *dirname;
 TEST_OPTION(dirname, string, "directory name", 1);
 
+/*
+ * zdtm roots the tree's cgroup namespace at a non-root cgroup (the
+ * 'cgroupns' flag), so the cgroup2 mount root below reads "/" here but
+ * not to CRIU.
+ */
 int main(int argc, char **argv)
 {
-	char cg[PATH_MAX], group[PATH_MAX], path[PATH_MAX], target[PATH_MAX], value[64];
+	char cg[PATH_MAX], path[PATH_MAX], target[PATH_MAX], value[64];
 	struct stat source_stat, bind_stat, fd_stat;
 	int fd, target_fd;
 
 	test_init(argc, argv);
-	if (unshare(CLONE_NEWNS) || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) ||
-	    mkdir(dirname, 0700) || mount("test", dirname, "tmpfs", 0, NULL))
+	if (mkdir(dirname, 0700) || mount("test", dirname, "tmpfs", 0, NULL))
 		return 1;
 	ssprintf(cg, "%s/cgroup", dirname);
 	if (mkdir(cg, 0700) || mount("none", cg, "cgroup2", 0, NULL))
-		return 1;
-	ssprintf(group, "%s/zdtm-cgroupv2-file-bind", cg);
-	ssprintf(path, "%s/cgroup.procs", group);
-	ssprintf(value, "%d", getpid());
-	if (mkdir(group, 0755) || write_value(path, value) || unshare(CLONE_NEWCGROUP) || umount(cg) ||
-	    mount("none", cg, "cgroup2", 0, NULL))
 		return 1;
 	ssprintf(path, "%s/memory.pressure", cg);
 	ssprintf(target, "%s/pressure", dirname);
@@ -42,7 +39,8 @@ int main(int argc, char **argv)
 	if (mount(path, target, NULL, MS_BIND, NULL) ||
 	    mount(NULL, cg, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL))
 		return 1;
-	fd = open(target, O_RDWR);
+	/* Read-only: CRIU refuses writable PSI descriptors (trigger state). */
+	fd = open(target, O_RDONLY);
 	if (fd < 0)
 		return 1;
 
