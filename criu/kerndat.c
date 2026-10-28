@@ -100,6 +100,7 @@ static int check_pagemap(void)
 			break;
 		default:
 			pr_perror("PAGEMAP_SCAN failed with unexpected errno");
+			close(fd);
 			return -1;
 		}
 	}
@@ -801,7 +802,7 @@ static int kerndat_detect_stack_guard_gap(void)
 	unsigned long start, end;
 	char r, w, x, s;
 	char buf[1024];
-	FILE *maps;
+	FILE *maps = NULL;
 	void *mem;
 
 	mem = mmap(NULL, (3ul << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
@@ -821,8 +822,7 @@ static int kerndat_detect_stack_guard_gap(void)
 	maps = fopen("/proc/self/maps", "r");
 	if (maps == NULL) {
 		pr_perror("Could not open /proc/self/maps");
-		munmap(mem, 4096);
-		return -1;
+		goto err;
 	}
 
 	while (fgets(buf, sizeof(buf), maps)) {
@@ -864,7 +864,8 @@ static int kerndat_detect_stack_guard_gap(void)
 
 err:
 	munmap(mem, (1ul << 20));
-	fclose(maps);
+	if (maps)
+		fclose(maps);
 	return ret;
 }
 
@@ -1134,9 +1135,9 @@ static int kerndat_has_move_mount_set_group(void)
 	exit_code = 0;
 out:
 	if (umount2(tmpdir, MNT_DETACH))
-		pr_warn("Fail to umount2 %s: %s\n", tmpdir, strerror(errno));
+		pr_pwarn("Fail to umount2 %s", tmpdir);
 	if (rmdir(tmpdir))
-		pr_warn("Fail to rmdir %s: %s\n", tmpdir, strerror(errno));
+		pr_pwarn("Fail to rmdir %s", tmpdir);
 	return exit_code;
 }
 
@@ -1313,7 +1314,7 @@ static void kerndat_save_cache(void)
 	if (ret < 0) {
 		pr_perror("Couldn't save %s", kdat_file);
 	unl:
-		unlink(kdat_file);
+		unlink(kdat_file_tmp);
 	}
 }
 

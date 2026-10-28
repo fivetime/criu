@@ -313,9 +313,10 @@ int compel_interrupt_task(int pid)
 		/*
 		 * ptrace API doesn't allow to distinguish
 		 * attaching to zombie from other errors.
-		 * All errors will be handled in compel_wait_task().
+		 * All errors will be handled in compel_wait_task()
+		 * or by the caller.
 		 */
-		pr_warn("Unable to interrupt task: %d (%s)\n", pid, strerror(errno));
+		pr_info("Unable to seize task %d: %s\n", pid, strerror(errno));
 		return ret;
 	}
 
@@ -330,7 +331,7 @@ int compel_interrupt_task(int pid)
 	 */
 	ret = ptrace(PTRACE_INTERRUPT, pid, NULL, NULL);
 	if (ret < 0) {
-		pr_warn("SEIZE %d: can't interrupt task: %s\n", pid, strerror(errno));
+		pr_pwarn("SEIZE %d: can't interrupt task", pid);
 		if (ptrace(PTRACE_DETACH, pid, NULL, NULL))
 			pr_perror("Unable to detach from %d", pid);
 	}
