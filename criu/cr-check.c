@@ -397,6 +397,9 @@ static int check_fdinfo_eventpoll(void)
 	pr_info("Epoll fdinfo works OK\n");
 
 epoll_err:
+	for (int i = 0; i < efe.n_tfd; i++)
+		xfree(efe.tfd[i]);
+	xfree(efe.tfd);
 	close(efd);
 pipe_err:
 	close(pfd[0]);
@@ -428,16 +431,19 @@ static int check_fdinfo_inotify(void)
 
 	if (ret < 0) {
 		pr_err("Error parsing proc fdinfo\n");
-		return -1;
-	}
-
-	if (ify.n_wd != 1 || ify.wd[0]->wd != wd) {
+		ret = -1;
+	} else if (ify.n_wd != 1 || ify.wd[0]->wd != wd) {
 		pr_err("WD mismatch (or not met)\n");
-		return -1;
+		ret = -1;
+	} else {
+		pr_info("Inotify fdinfo works OK\n");
+		ret = 0;
 	}
 
-	pr_info("Inotify fdinfo works OK\n");
-	return 0;
+	for (int i = 0; i < ify.n_wd; i++)
+		xfree(ify.wd[i]);
+	xfree(ify.wd);
+	return ret;
 }
 
 static int check_fdinfo_ext(void)
@@ -932,6 +938,7 @@ struct clone_arg {
 
 static int clone_cb(void *_arg)
 {
+	lsan_skip_leak_check();
 	exit(0);
 }
 
@@ -1071,7 +1078,7 @@ out:
 	return ret;
 }
 
-static int check_tcp_halt_closed(void)
+static int check_tcp_half_closed(void)
 {
 	if (!kdat.has_tcp_half_closed) {
 		pr_err("TCP_REPAIR can't be enabled for half-closed sockets\n");
@@ -1707,7 +1714,7 @@ int cr_check(void)
 		ret |= check_clone_parent_vs_pid();
 		ret |= check_cgroupns();
 		ret |= check_tcp_window();
-		ret |= check_tcp_halt_closed();
+		ret |= check_tcp_half_closed();
 		ret |= check_userns();
 		ret |= check_loginuid();
 		ret |= check_can_map_vdso();
@@ -1860,7 +1867,7 @@ static struct feature_list feature_list[] = {
 	{ "loginuid", check_loginuid },
 	{ "cgroupns", check_cgroupns },
 	{ "autofs", check_autofs },
-	{ "tcp_half_closed", check_tcp_halt_closed },
+	{ "tcp_half_closed", check_tcp_half_closed },
 	{ "compat_cr", check_compat_cr },
 	{ "uffd", check_uffd },
 	{ "uffd-noncoop", check_uffd_noncoop },
@@ -1891,6 +1898,7 @@ static struct feature_list feature_list[] = {
 	{ "timer_cr_ids", check_timer_cr_ids },
 	{ "overlayfs_maps", check_overlayfs_maps },
 	{ "pagemap_scan_guard_pages", check_pagemap_scan_guard_pages },
+	{ "statmount_by_fd", check_statmount_by_fd },
 	{ "binfmt_misc_sandboxing", check_binfmt_misc_sandboxing },
 	{ "compress", check_compress },
 	{ "encryption", check_encryption },

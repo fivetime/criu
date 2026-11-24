@@ -85,6 +85,7 @@
 #include "sk-queue.h"
 #include "sigframe.h"
 #include "fdstore.h"
+#include "extmem.h"
 #include "string.h"
 #include "memfd.h"
 #include "timens.h"
@@ -1533,6 +1534,11 @@ static int __restore_task_with_children(void *_arg)
 	int ret;
 
 	current = ca->item;
+	/*
+	 * Restored tasks either switch to the restorer or exit()
+	 * (zombies, helpers, errors), possibly with no usable /proc.
+	 */
+	lsan_skip_leak_check();
 
 	if (current != root_item) {
 		char buf[12];
@@ -2216,6 +2222,13 @@ skip_ns_bouncing:
 	if (ret < 0)
 		goto out_kill;
 
+	/* ACT_PRE_RESUME runs after sealing, so verify provider readiness here. */
+	ret = extmem_wait_ready();
+	if (ret < 0 && ret != -ENOTSUP) {
+		pr_err("External memory provider is not ready\n");
+		goto out_kill;
+	}
+
 	ret = apply_memfd_seals();
 	if (ret < 0)
 		goto out_kill;
@@ -2370,6 +2383,14 @@ skip_ns_bouncing:
 	/* This has the effect of dismissing the image streamer */
 	close_image_dir();
 
+	/*
+	 * The tasks are running, so a COMMIT failure can't roll back the
+	 * restore. Send it before reap_zombies(), which waits for the whole
+	 * tree to exit when CRIU doesn't detach from it.
+	 */
+	if (extmem_commit())
+		pr_err("Failed to commit external memory provider session\n");
+
 	ret = run_scripts(ACT_POST_RESUME);
 	if (ret != 0)
 		pr_err("Post-resume script ret code %d\n", ret);
@@ -2474,6 +2495,8 @@ int prepare_dummy_task_state(struct pstree_item *pi)
 
 int cr_restore_tasks(void)
 {
+	bool plugin_initialized = false;
+	int extmem_ret;
 	int ret = -1;
 
 	if (init_service_fd())
@@ -2499,19 +2522,29 @@ int cr_restore_tasks(void)
 	if (tty_init_restore())
 		return -1;
 
+	/*
+	 * Initialize the provider before reading restore images. It takes its
+	 * inherited FD, so this goes before inherit_fd_move_to_fdstore().
+	 */
+	extmem_ret = extmem_init();
+	if (extmem_ret < 0 && extmem_ret != -ENOTSUP) {
+		ret = extmem_ret;
+		goto err;
+	}
+
 	if (opts.cpu_cap & CPU_CAP_IMAGE) {
 		if (cpu_validate_cpuinfo())
-			return -1;
+			goto err;
 	}
 
 	if (prepare_task_entries() < 0)
-		return -1;
+		goto err;
 
 	if (prepare_pstree() < 0)
-		return -1;
+		goto err;
 
 	if (fdstore_init())
-		return -1;
+		goto err;
 
 	/*
 	 * For the AMDGPU plugin, its parallel restore feature needs to use fdstore to store
@@ -2520,7 +2553,8 @@ int cr_restore_tasks(void)
 	 * must be initialized after fdstore_init.
 	 */
 	if (cr_plugin_init(CR_PLUGIN_STAGE__RESTORE))
-		return -1;
+		goto err;
+	plugin_initialized = true;
 
 	if (inherit_fd_move_to_fdstore())
 		goto err;
@@ -2541,14 +2575,22 @@ int cr_restore_tasks(void)
 clean_cgroup:
 	fini_cgroup();
 err:
-	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
+	if (plugin_initialized)
+		cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
+	/* On success, restore_root_task() has already sent COMMIT. */
+	if (ret && extmem_is_active() && extmem_abort())
+		pr_err("Failed to abort external memory provider session\n");
 	return ret;
 }
 
-static long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_head *self_vma_list, long min_addr, long vma_len)
+static unsigned long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_head *self_vma_list,
+					   unsigned long min_addr, unsigned long vma_len,
+					   unsigned long reserved_start, unsigned long reserved_len)
 {
+	unsigned long reserved_end = reserved_start + reserved_len;
 	struct vma_area *t_vma, *s_vma;
-	long prev_vma_end = min_addr;
+	unsigned long prev_vma_end = min_addr;
+	unsigned long vma_end;
 	struct vma_area end_vma;
 	VmaEntry end_e;
 
@@ -2561,7 +2603,11 @@ static long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_he
 	t_vma = list_first_entry(tgt_vma_list, struct vma_area, list);
 
 	while (1) {
-		if (prev_vma_end + vma_len > s_vma->e->start) {
+		if (vma_len > kdat.task_size || prev_vma_end > kdat.task_size - vma_len)
+			break;
+		vma_end = prev_vma_end + vma_len;
+
+		if (vma_end > s_vma->e->start) {
 			if (s_vma == &end_vma)
 				break;
 
@@ -2581,7 +2627,7 @@ static long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_he
 			continue;
 		}
 
-		if (prev_vma_end + vma_len > t_vma->e->start) {
+		if (vma_end > t_vma->e->start) {
 			if (t_vma == &end_vma)
 				break;
 
@@ -2602,10 +2648,24 @@ static long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_he
 			continue;
 		}
 
+		/*
+		 * The premapped area is not fully covered by self_vma_list.
+		 * On kernels that hide the stack guard gap, unmap_guard_pages()
+		 * leaves a one-page hole in front of each premapped grow-down
+		 * VMA. If that VMA is the first one, the hole is the first page
+		 * of the area and adjoins the free space below it, so the
+		 * restorer bootstrap could end in it. Keep the bootstrap out
+		 * of the whole area.
+		 */
+		if (reserved_len && prev_vma_end < reserved_end && vma_end > reserved_start) {
+			prev_vma_end = reserved_end;
+			continue;
+		}
+
 		return prev_vma_end;
 	}
 
-	return -1;
+	return (unsigned long)-1;
 }
 
 static int prepare_mm(pid_t pid, struct task_restore_args *args)
@@ -3296,7 +3356,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	struct vm_area_list self_vmas;
 	struct vm_area_list *vmas = &rsti(current)->vmas;
-	int i, siginfo_n;
+	int i, siginfo_n, nr_has_personality = 0;
 
 	unsigned long creds_pos = 0;
 	unsigned long creds_pos_next;
@@ -3375,7 +3435,9 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	mem = (void *)restorer_get_vma_hint(&vmas->h, &self_vmas.h,
 					    shstk_min_mmap_addr(&task_args->shstk, kdat.mmap_min_addr),
-					    task_args->bootstrap_len);
+					    task_args->bootstrap_len,
+					    (unsigned long)rsti(current)->premmapped_addr,
+					    rsti(current)->premmapped_len);
 	if (mem == (void *)-1) {
 		pr_err("No suitable area for task_restore bootstrap (%ldK)\n", task_args->bootstrap_len);
 		goto err;
@@ -3459,6 +3521,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	task_args->premmapped_addr = (unsigned long)rsti(current)->premmapped_addr;
 	task_args->premmapped_len = rsti(current)->premmapped_len;
+	task_args->thp_pmd_size = kdat.thp_pmd_size;
 
 	task_args->task_size = kdat.task_size;
 #ifdef ARCH_HAS_LONG_PAGES
@@ -3594,6 +3657,12 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 			thread_args[i].timerslack_ns = tcore->thread_core->timerslack_ns;
 		}
 
+		if (tcore->thread_core->has_personality) {
+			thread_args[i].has_personality = true;
+			thread_args[i].personality = tcore->thread_core->personality;
+			nr_has_personality++;
+		}
+
 		ret = prep_sched_info(&thread_args[i].sp, tcore->thread_core);
 		if (ret)
 			goto err;
@@ -3618,6 +3687,14 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		thread_args[i].comm[TASK_COMM_LEN - 1] = 0;
 
 		pr_info("Thread %4d stack %8p rt_sigframe %8p\n", i, mz[i].stack, mz[i].rt_sigframe);
+	}
+
+	if (nr_has_personality == 0) {
+		pr_info("No per-thread personality in image, skipping personality restore (legacy image)\n");
+	} else if (nr_has_personality < current->nr_threads) {
+		pr_err("Inconsistent personality across threads in core images (%d/%d)\n",
+		       nr_has_personality, current->nr_threads);
+		goto err;
 	}
 
 	/*
@@ -3676,6 +3753,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	close_image_dir();
 	close_proc();
 	close_service_fd(TRANSPORT_FD_OFF);
+	close_service_fd(EXTMEM_PROVIDER_FD_OFF);
 	close_service_fd(CR_PROC_FD_OFF);
 	close_service_fd(ROOT_FD_OFF);
 	close_service_fd(USERNSD_SK);

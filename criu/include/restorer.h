@@ -117,6 +117,8 @@ struct thread_restore_args {
 	int pdeath_sig;
 	bool has_timerslack_ns;
 	unsigned long timerslack_ns;
+	bool has_personality;
+	u32 personality;
 
 	struct thread_creds_args *creds_args;
 
@@ -209,6 +211,7 @@ struct task_restore_args {
 	unsigned long task_size;
 	unsigned long premmapped_addr;
 	unsigned long premmapped_len;
+	unsigned long thp_pmd_size;
 	rt_sigaction_t sigchld_act;
 
 	void *bootstrap_start;

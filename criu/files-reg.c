@@ -329,6 +329,11 @@ static int copy_chunk_to_file(int img, int fd, off_t off, size_t len)
 			pr_perror("Can't send data");
 			return -1;
 		}
+		if (ret == 0) {
+			pr_err("Unexpected EOF in ghost file image: %zu bytes left at off %" PRId64 "\n",
+			       len, (int64_t)off);
+			return -1;
+		}
 
 		off += ret;
 		len -= ret;
@@ -1778,7 +1783,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	snprintf(ext_id, sizeof(ext_id), "file[%x:%" PRIx64 "]", p->mnt_id, p->stat.st_ino);
 	if (external_lookup_id(ext_id)) {
 		/* the first symbol will be cut on restore to get an relative path*/
-		rfe.name = xstrdup(ext_id);
+		rfe.name = ext_id;
 		rfe.ext = true;
 		rfe.has_ext = true;
 		goto ext;
