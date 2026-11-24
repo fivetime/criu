@@ -20,6 +20,7 @@
 #include "img-streamer.h"
 #include "namespaces.h"
 #include "compression.h"
+#include "extmem.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -388,8 +389,7 @@ int write_img_inventory(InventoryEntry *he, const InventoryEntry *parent_ie)
 	free_inventory_plugins_list();
 	xfree(pe.plugins);
 
-	xfree(he->root_ids);
-	xfree(he->dump_criu_run_id);
+	free_inventory(he);
 	close_image(img);
 	if (ret < 0)
 		return -1;
@@ -509,13 +509,12 @@ int prepare_inventory(InventoryEntry *he, const InventoryEntry *parent_ie)
 	crt.i.pid->real = getpid();
 	if (get_task_ids(&crt.i))
 		return -1;
+	he->root_ids = crt.i.ids;
 
 	if (!opts.unprivileged)
 		he->has_root_cg_set = true;
 	if (dump_thread_cgroup(NULL, &he->root_cg_set, NULL, -1))
 		return -1;
-
-	he->root_ids = crt.i.ids;
 
 	/* tcp_close has to be set on restore if it has been set on dump. */
 	if (opts.tcp_close) {
@@ -544,6 +543,15 @@ int prepare_inventory(InventoryEntry *he, const InventoryEntry *parent_ie)
 	}
 
 	return 0;
+}
+
+/* Free what prepare_inventory() has allocated. */
+void free_inventory(InventoryEntry *he)
+{
+	xfree(he->root_ids);
+	he->root_ids = NULL;
+	xfree(he->dump_criu_run_id);
+	he->dump_criu_run_id = NULL;
 }
 
 static struct cr_imgset *alloc_cr_imgset(int nr)
@@ -765,11 +773,30 @@ static int img_openat(int dfd, const char *path, int flags)
 
 static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long oflags, char *path)
 {
-	int ret, flags;
+	int ret, flags, provider_fd = -1;
+	int provider_ret;
 
 	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL);
 
-	if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
+	/*
+	 * OPEN_IMAGE has no checkpoint ID, so parent images stay local.
+	 * Restore reads the inventory before the provider session starts,
+	 * so the inventory is never handed to the provider.
+	 */
+	if (dfd != get_service_fd(IMG_FD_OFF) || (oflags & O_FORCE_LOCAL) ||
+	    type == CR_FD_INVENTORY || (oflags & O_DUMP && opts.mode != CR_DUMP))
+		provider_ret = -ENOTSUP;
+	else
+		provider_ret = extmem_open_image(path, flags, &provider_fd);
+
+	if (provider_ret == 0)
+		ret = provider_fd;
+	else if (provider_ret == -1 && errno == ENOENT)
+		ret = -ENOENT;
+	else if (provider_ret != -ENOTSUP) {
+		pr_err("External memory provider failed to open %s\n", path);
+		return -1;
+	} else if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
 		ret = img_streamer_open(path, flags);
 		errno = EIO; /* errno value is meaningless, only the ret value is meaningful */
 	} else if (root_ns_mask & CLONE_NEWUSER && type == CR_FD_PAGES && oflags & O_RDWR) {
@@ -882,6 +909,8 @@ int image_dir_mode(void)
 	case CR_PRE_DUMP:
 		return O_DUMP;
 	case CR_RESTORE:
+		/* fallthrough */
+	case CR_LAZY_PAGES:
 		return O_RSTR;
 	default:
 		return -1;
@@ -985,16 +1014,25 @@ void up_page_ids_base(void)
 	page_ids += 0x10000;
 }
 
+int read_pages_image_id(struct cr_img *pmi, u32 *id)
+{
+	PagemapHead *h;
+
+	if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
+		return -1;
+	*id = h->pages_id;
+	pagemap_head__free_unpacked(h, NULL);
+
+	return 0;
+}
+
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
 	unsigned long mode = flags & ~O_FORCE_LOCAL;
 
 	if (mode == O_RDONLY || mode == O_RDWR) {
-		PagemapHead *h;
-		if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
+		if (read_pages_image_id(pmi, id) < 0)
 			return NULL;
-		*id = h->pages_id;
-		pagemap_head__free_unpacked(h, NULL);
 	} else {
 		PagemapHead h = PAGEMAP_HEAD__INIT;
 		*id = h.pages_id = page_ids++;

@@ -37,6 +37,7 @@
 #include "image.h"
 #include "sk-inet.h"
 #include "vma.h"
+#include "hugetlb.h"
 #include "uffd.h"
 #include "sched.h"
 
@@ -711,6 +712,37 @@ static int restore_thread_common(struct thread_restore_args *args)
 	return 0;
 }
 
+/*
+ * Restore the per-thread personality.
+ *
+ * This runs after every mmap() and clone() the restorer performs (the last
+ * one being alloc_compat_syscall_stack()), so a READ_IMPLIES_EXEC bit in
+ * the dumped personality cannot silently promote those mappings to RWX.
+ * It also runs before restore_seccomp(), since the restored filter may
+ * block personality(2) outright.
+ */
+static int restore_personality(struct thread_restore_args *args)
+{
+	long ret;
+
+	if (!args->has_personality)
+		return 0;
+
+	/*
+	 * Personality is a u32. On 64-bit the previous value is zero-extended
+	 * into long, but on 32-bit long is 32-bit too, so any value with bit
+	 * 31 set looks negative. Only -MAX_ERRNO..-1 (-4095..-1) are real
+	 * syscall errors.
+	 */
+	ret = sys_personality(args->personality);
+	if (ret < 0 && ret > -4096) {
+		pr_err("Unable to set personality 0x%x: %ld\n", args->personality, ret);
+		return -1;
+	}
+
+	return 0;
+}
+
 static void noinline rst_sigreturn(unsigned long new_sp, struct rt_sigframe *sigframe)
 {
 	ARCH_RT_SIGRETURN_RST(new_sp, sigframe);
@@ -875,6 +907,9 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 	if (restore_signals(args->siginfo, args->siginfo_n, false))
 		goto core_restore_end;
 
+	if (restore_personality(args))
+		goto core_restore_end;
+
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
 
 	/*
@@ -976,6 +1011,10 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 	 * image files, once in process). Unfortunately, MAP_LOCKED defeats
 	 * that mechanism as it causes the process to be charged for memory
 	 * immediately upon mmap, not later upon preadv().
+	 *
+	 * MAP_LOCKED may also populate pages during mmap(), before the THP
+	 * advice is applied, so such a mapping may not get the page size
+	 * it asked for.
 	 */
 	pr_debug("\tmmap(%" PRIx64 " -> %" PRIx64 ", %x %x %d)\n", vma_entry->start, vma_entry->end, prot, flags,
 		 (int)vma_entry->fd);
@@ -1175,7 +1214,7 @@ static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 	return 0;
 }
 
-static int vma_remap(VmaEntry *vma_entry, int uffd)
+static int vma_remap(VmaEntry *vma_entry, int uffd, unsigned long thp_pmd_size)
 {
 	unsigned long src = vma_premmaped_start(vma_entry);
 	unsigned long dst = vma_entry->start;
@@ -1234,7 +1273,7 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 		 * |G|---tgt-----|                          |
 		 */
 
-		unsigned long addr;
+		unsigned long addr, align = 0, pad = 0;
 
 		/* Map guard page (step 2) */
 		tmp = sys_mmap((void *)guard, PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
@@ -1243,11 +1282,59 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 			return -1;
 		}
 
+		/*
+		 * mremap() keeps PMD-mapped huge pages only if the source
+		 * and the destination have the same offset within a PMD.
+		 * Otherwise it splits them. Place the temporary area at the
+		 * same PMD offset as src, so that the huge pages survive
+		 * the move to the temporary area. Both addresses are
+		 * page-aligned, so the skipped head is never larger than
+		 * align - PAGE_SIZE.
+		 */
+		if (vma_entry->flags & MAP_HUGETLB) {
+			align = vma_entry_pagesize(vma_entry);
+			if (!align)
+				return -1;
+		} else if (uffd < 0 && thp_pmd_size && len >= thp_pmd_size &&
+			   !((src ^ dst) & (thp_pmd_size - 1)) &&
+			   round_up(dst, thp_pmd_size) <= vma_entry->end - thp_pmd_size &&
+			   vma_entry_thp_advice(vma_entry) != MADV_NOHUGEPAGE &&
+			   !vma_entry_is(vma_entry, VMA_AREA_SHSTK)) {
+			align = thp_pmd_size;
+		}
+		if (align) {
+			pad = align - PAGE_SIZE;
+			if (len > ULONG_MAX - pad)
+				return -1;
+		}
+
 		/* Move src to non-overlapping place (step 3) */
-		addr = sys_mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+		addr = sys_mmap(NULL, len + pad, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 		if (IS_ERR((void *)addr)) {
 			pr_err("Unable to reserve memory (%lx)\n", addr);
 			return -1;
+		}
+
+		if (align) {
+			unsigned long head = (src - addr) & (align - 1);
+			unsigned long tail = pad - head;
+
+			if (head) {
+				tmp = sys_munmap((void *)addr, head);
+				if (tmp) {
+					pr_err("Unable to unmap %lx (%lx)\n", addr, tmp);
+					return -1;
+				}
+				addr += head;
+			}
+
+			if (tail) {
+				tmp = sys_munmap((void *)(addr + len), tail);
+				if (tmp) {
+					pr_err("Unable to unmap %lx (%lx)\n", addr + len, tmp);
+					return -1;
+				}
+			}
 		}
 
 		tmp = sys_mremap(src, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, addr);
@@ -1482,53 +1569,126 @@ static int unregister_libc_rseq(struct rst_rseq_param *rseq)
  * This function unmaps all VMAs, which don't belong to
  * the restored process or the restorer.
  *
- * The restorer memory is two regions -- area with restorer, its stack
- * and arguments and the one with private vmas of the tasks we restore
- * (a.k.a. premmaped area):
+ * The restorer memory is up to two regions -- area with restorer, its stack
+ * and arguments and, when non-empty, the one with private vmas of the tasks
+ * we restore (a.k.a. premmaped area):
  *
  * 0                       task_size
  * +----+====+----+====+---+
  *
- * Thus to unmap old memory we have to do 3 unmaps:
+ * Thus to unmap old memory we have to do up to 3 unmaps:
  * [ 0 -- 1st area start ]
  * [ 1st end -- 2nd start ]
- * [ 2nd start -- task_size ]
+ * [ 2nd end -- task_size ]
  */
 static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len, void *bootstrap_start,
 			  unsigned long bootstrap_len, unsigned long task_size)
 {
-	unsigned long s1, s2;
-	void *p1, *p2;
+	unsigned long p1, p2, s1, s2;
 	int ret;
 
+	if (!premmapped_len) {
+		p1 = (unsigned long)bootstrap_start;
+		p2 = p1 + bootstrap_len;
+
+		if (p1 > 0) {
+			ret = sys_munmap(NULL, p1);
+			if (ret) {
+				pr_err("Unable to unmap (%p-%p): %d\n", NULL, (void *)p1, ret);
+				return -1;
+			}
+		}
+
+		if (p2 < task_size) {
+			ret = sys_munmap((void *)p2, task_size - p2);
+			if (ret) {
+				pr_err("Unable to unmap (%p-%p): %d\n", (void *)p2, (void *)task_size, ret);
+				return -1;
+			}
+		}
+
+		return 0;
+	}
+
 	if (premmapped_addr < bootstrap_start) {
-		p1 = premmapped_addr;
+		p1 = (unsigned long)premmapped_addr;
 		s1 = premmapped_len;
-		p2 = bootstrap_start;
+		p2 = (unsigned long)bootstrap_start;
 		s2 = bootstrap_len;
 	} else {
-		p2 = premmapped_addr;
-		s2 = premmapped_len;
-		p1 = bootstrap_start;
+		p1 = (unsigned long)bootstrap_start;
 		s1 = bootstrap_len;
+		p2 = (unsigned long)premmapped_addr;
+		s2 = premmapped_len;
 	}
 
-	ret = sys_munmap(NULL, p1 - NULL);
-	if (ret) {
-		pr_err("Unable to unmap (%p-%p): %d\n", NULL, p1, ret);
+	if (p1 + s1 > p2) {
+		pr_err("Premapped %p(%lx) and bootstrap %p(%lx) areas overlap\n",
+		       premmapped_addr, premmapped_len, bootstrap_start, bootstrap_len);
 		return -1;
 	}
 
-	ret = sys_munmap(p1 + s1, p2 - (p1 + s1));
-	if (ret) {
-		pr_err("Unable to unmap (%p-%p): %d\n", p1 + s1, p2, ret);
-		return -1;
+	if (p1 > 0) {
+		ret = sys_munmap(NULL, p1);
+		if (ret) {
+			pr_err("Unable to unmap (%p-%p): %d\n", NULL, (void *)p1, ret);
+			return -1;
+		}
 	}
 
-	ret = sys_munmap(p2 + s2, task_size - (unsigned long)(p2 + s2));
-	if (ret) {
-		pr_err("Unable to unmap (%p-%p): %d\n", p2 + s2, (void *)task_size, ret);
-		return -1;
+	if (p2 > p1 + s1) {
+		ret = sys_munmap((void *)(p1 + s1), p2 - (p1 + s1));
+		if (ret) {
+			pr_err("Unable to unmap (%p-%p): %d\n", (void *)(p1 + s1), (void *)p2, ret);
+			return -1;
+		}
+	}
+
+	if (p2 + s2 < task_size) {
+		ret = sys_munmap((void *)(p2 + s2), task_size - (p2 + s2));
+		if (ret) {
+			pr_err("Unable to unmap (%p-%p): %d\n", (void *)(p2 + s2), (void *)task_size, ret);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Premapped VMAs are placed one by one in the premapped area, in the order of
+ * args->vmas. There may be holes between them: room skipped for huge-page
+ * alignment, and guard pages of grow-down VMAs. They are unmapped here,
+ * once all CRIU mappings are gone and before any VMA is moved to its target
+ * place, which may intersect the premapped area.
+ */
+static int unmap_premmapped_gaps(struct task_restore_args *args)
+{
+	unsigned long addr = args->premmapped_addr;
+	int i, ret;
+
+	for (i = 0; i < args->vmas_n; i++) {
+		VmaEntry *vma_entry = args->vmas + i;
+		unsigned long start;
+
+		if (!vma_entry_is(vma_entry, VMA_PREMMAPED))
+			continue;
+
+		start = vma_premmaped_start(vma_entry);
+		if (start < addr) {
+			pr_err("Premapped VMAs are not sorted (%lx < %lx)\n", start, addr);
+			return -1;
+		}
+
+		if (start > addr) {
+			ret = sys_munmap((void *)addr, start - addr);
+			if (ret) {
+				pr_err("Unable to unmap (%lx-%lx): %d\n", addr, start, ret);
+				return -1;
+			}
+		}
+
+		addr = start + vma_entry_len(vma_entry);
 	}
 
 	return 0;
@@ -2397,6 +2557,9 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			   args->task_size))
 		goto core_restore_end;
 
+	if (unmap_premmapped_gaps(args))
+		goto core_restore_end;
+
 	/* Map vdso that wasn't parked */
 	if (args->can_map_vdso && (map_vdso(args, args->compatible_mode) < 0))
 		goto core_restore_end;
@@ -2416,7 +2579,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start > vma_entry->shmid)
 			break;
 
-		if (vma_remap(vma_entry, args->uffd))
+		if (vma_remap(vma_entry, args->uffd, args->thp_pmd_size))
 			goto core_restore_end;
 	}
 
@@ -2433,7 +2596,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start < vma_entry->shmid)
 			break;
 
-		if (vma_remap(vma_entry, args->uffd))
+		if (vma_remap(vma_entry, args->uffd, args->thp_pmd_size))
 			goto core_restore_end;
 	}
 
@@ -2470,6 +2633,27 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (va != vma_entry->start) {
 			pr_err("Can't restore %" PRIx64 " mapping with %lx\n", vma_entry->start, va);
 			goto core_restore_end;
+		}
+
+		/*
+		 * Apply THP advice before the contents are read in below, so
+		 * pages are faulted in at the size the task asked for. The
+		 * madvise() bits restored at the end come too late for that.
+		 * Lazy restore is left alone. A lazy VMA can hold eager pages
+		 * too, and a huge page faulted in for one of them would
+		 * populate the lazy pages around it.
+		 */
+		if (args->uffd < 0 && vma_entry_is(vma_entry, VMA_AREA_REGULAR)) {
+			int advice = vma_entry_thp_advice(vma_entry);
+
+			if (advice) {
+				ret = sys_madvise(va, vma_entry_len(vma_entry), advice);
+				if (ret) {
+					pr_err("madvise(%lx, %" PRIu64 ", %d) failed with %ld\n", va,
+					       vma_entry_len(vma_entry), advice, ret);
+					goto core_restore_end;
+				}
+			}
 		}
 	}
 
@@ -2812,6 +2996,9 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	ret = restore_signals(args->t->siginfo, args->t->siginfo_n, false);
 	if (ret)
+		goto core_restore_end;
+
+	if (restore_personality(args->t))
 		goto core_restore_end;
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);

@@ -48,7 +48,7 @@ static int set_opts_string(char **dst, const char *src)
 	return 0;
 }
 
-void criu_free_service(criu_opts *opts)
+static void criu_free_service(criu_opts *opts)
 {
 	switch (opts->service_comm) {
 	case CRIU_COMM_SK:
@@ -242,6 +242,7 @@ void criu_local_free_opts(criu_opts *opts)
 			}
 			free(opts->rpc->join_ns[i]);
 		}
+		free(opts->rpc->join_ns);
 	}
 	opts->rpc->n_join_ns = 0;
 
@@ -257,6 +258,7 @@ void criu_local_free_opts(criu_opts *opts)
 	free(opts->rpc->parent_img);
 	free(opts->rpc->root);
 	free(opts->rpc->freeze_cgroup);
+	free(opts->rpc->images_dir);
 	free(opts->rpc->log_file);
 	free(opts->rpc->lsm_profile);
 	free(opts->rpc->lsm_mount_context);
@@ -359,6 +361,22 @@ void criu_local_set_images_dir_fd(criu_opts *opts, int fd)
 void criu_set_images_dir_fd(int fd)
 {
 	criu_local_set_images_dir_fd(global_opts, fd);
+}
+
+int criu_local_set_images_dir(criu_opts *opts, const char *dir)
+{
+	int ret;
+
+	ret = set_opts_string(&opts->rpc->images_dir, dir);
+	if (!ret)
+		opts->rpc->images_dir_fd = -1;
+
+	return ret;
+}
+
+int criu_set_images_dir(const char *dir)
+{
+	return criu_local_set_images_dir(global_opts, dir);
 }
 
 int criu_local_set_parent_images(criu_opts *opts, const char *path)
@@ -600,7 +618,12 @@ int criu_local_add_unix_sk(criu_opts *opts, unsigned int inode)
 	/*if user disabled ext_unix_sk and try to add unixsk inode after that*/
 	if (opts->rpc->has_ext_unix_sk && !opts->rpc->ext_unix_sk) {
 		if (opts->rpc->n_unix_sk_ino > 0) {
+			size_t i;
+
+			for (i = 0; i < opts->rpc->n_unix_sk_ino; i++)
+				free(opts->rpc->unix_sk_ino[i]);
 			free(opts->rpc->unix_sk_ino);
+			opts->rpc->unix_sk_ino = NULL;
 			opts->rpc->n_unix_sk_ino = 0;
 		}
 		return -1;
@@ -921,27 +944,35 @@ void criu_set_cpu_cap(unsigned int cap)
 int criu_local_set_exec_cmd(criu_opts *opts, int argc, char *argv[])
 {
 	int i;
+	char **exec_cmd;
 
-	opts->rpc->n_exec_cmd = argc;
-	opts->rpc->exec_cmd = malloc((argc) * sizeof(char *));
+	exec_cmd = malloc(argc * sizeof(char *));
+	if (!exec_cmd)
+		return -ENOMEM;
 
-	if (opts->rpc->exec_cmd) {
-		for (i = 0; i < argc; i++) {
-			opts->rpc->exec_cmd[i] = strdup(argv[i]);
-			if (!opts->rpc->exec_cmd[i]) {
-				while (i > 0)
-					free(opts->rpc->exec_cmd[i--]);
-				free(opts->rpc->exec_cmd);
-				opts->rpc->n_exec_cmd = 0;
-				opts->rpc->exec_cmd = NULL;
-				goto out;
-			}
+	for (i = 0; i < argc; i++) {
+		exec_cmd[i] = strdup(argv[i]);
+		if (!exec_cmd[i]) {
+			int j;
+
+			for (j = 0; j < i; j++)
+				free(exec_cmd[j]);
+			free(exec_cmd);
+			return -ENOMEM;
 		}
-		return 0;
 	}
 
-out:
-	return -ENOMEM;
+	if (opts->rpc->exec_cmd) {
+		size_t j;
+
+		for (j = 0; j < opts->rpc->n_exec_cmd; j++)
+			free(opts->rpc->exec_cmd[j]);
+		free(opts->rpc->exec_cmd);
+	}
+
+	opts->rpc->exec_cmd = exec_cmd;
+	opts->rpc->n_exec_cmd = argc;
+	return 0;
 }
 
 int criu_set_exec_cmd(int argc, char *argv[])
@@ -1369,17 +1400,25 @@ int criu_add_plugin_option(const char *option)
 
 int criu_local_set_page_server_address_port(criu_opts *opts, const char *address, int port)
 {
-	opts->rpc->ps = malloc(sizeof(CriuPageServerInfo));
-	if (!opts->rpc->ps)
-		return -ENOMEM;
+	int ret;
+	bool newly_allocated = false;
 
-	criu_page_server_info__init(opts->rpc->ps);
+	if (!opts->rpc->ps) {
+		opts->rpc->ps = malloc(sizeof(CriuPageServerInfo));
+		if (!opts->rpc->ps)
+			return -ENOMEM;
 
-	opts->rpc->ps->address = strdup(address);
-	if (!opts->rpc->ps->address) {
-		free(opts->rpc->ps);
-		opts->rpc->ps = NULL;
-		return -ENOMEM;
+		criu_page_server_info__init(opts->rpc->ps);
+		newly_allocated = true;
+	}
+
+	ret = set_opts_string(&opts->rpc->ps->address, address);
+	if (ret) {
+		if (newly_allocated) {
+			free(opts->rpc->ps);
+			opts->rpc->ps = NULL;
+		}
+		return ret;
 	}
 
 	opts->rpc->ps->has_port = true;
@@ -2150,7 +2189,7 @@ int criu_local_join_ns_add(criu_opts *opts, const char *ns, const char *ns_file,
 	JoinNamespace **join_ns_arr, *join_ns = NULL;
 
 	if (!ns) {
-		fprintf(stderr, "ns parameter for join_ns is not specified");
+		fprintf(stderr, "ns parameter for join_ns is not specified\n");
 		goto err;
 	}
 
@@ -2161,7 +2200,7 @@ int criu_local_join_ns_add(criu_opts *opts, const char *ns, const char *ns_file,
 	}
 
 	if (!ns_file) {
-		fprintf(stderr, "ns parameter for join_ns is not specified");
+		fprintf(stderr, "ns_file parameter for join_ns is not specified\n");
 		goto err;
 	}
 

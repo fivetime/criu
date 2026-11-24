@@ -28,6 +28,7 @@ TST_NOFILE	:=				\
 		sse00				\
 		sse20				\
 		mprotect00			\
+		personality00			\
 		timers				\
 		timers01			\
 		timerfd				\
@@ -284,6 +285,8 @@ TST_NOFILE	:=				\
 		netns_sub_sysctl	\
 		unlink_multiple_largefiles	\
 		thp_disable			\
+		thp_advice			\
+		thp_advice_cow			\
 		pid_file			\
 		selinux00			\
 		selinux01			\
@@ -309,6 +312,11 @@ TST_NOFILE	:=				\
 		sigtrap01			\
 		change_mnt_context		\
 		fd_offset			\
+		extmem_image_fallback		\
+		extmem_vma_fallback		\
+		extmem_cow_fallback		\
+		extmem_hugetlb			\
+		extmem_recheckpoint		\
 #		jobctl00			\
 
 PKG_CONFIG ?= pkg-config
@@ -455,6 +463,7 @@ TST_DIR		=				\
 		inotify01			\
 		inotify02			\
 		inotify04			\
+		inotify_cgroup2			\
 		cgroup00			\
 		rmdir_open			\
 		cgroup01			\
@@ -469,6 +478,7 @@ TST_DIR		=				\
 		cgroup_yard			\
 		cgroup_newroot			\
 		cgroup_threads			\
+		cgroup_criu_set			\
 		unlink_fstat04			\
 		unlink_fstat041			\
 		mntns_remap			\
@@ -678,6 +688,7 @@ sigaltstack:		LDLIBS += -pthread
 seccomp_filter_tsync:	LDLIBS += -pthread
 seccomp_filter_threads:	LDLIBS += -pthread
 timerslack_ns:		LDLIBS += -pthread
+personality00:		LDLIBS += -pthread
 shm:			CFLAGS += -DNEW_IPC_NS
 msgque:			CFLAGS += -DNEW_IPC_NS
 sem:			CFLAGS += -DNEW_IPC_NS
@@ -720,6 +731,9 @@ mntns_root_bind02:	CFLAGS += -DROOT_BIND02
 maps02: get_smaps_bits.o
 mlock_setuid: get_smaps_bits.o
 thp_disable: get_smaps_bits.o
+thp_advice: get_smaps_bits.o
+thp_advice_cow: get_smaps_bits.o
+thp_advice_cow:		CFLAGS += -DTHP_COW
 reservation_mmaps: get_smaps_bits.o
 inotify01:		CFLAGS += -DINOTIFY01
 unlink_fstat01+:	CFLAGS += -DUNLINK_OVER
@@ -784,6 +798,7 @@ s390x_gs_threads:	LDFLAGS += -pthread
 thread_different_uid_gid:	LDLIBS += -pthread -lcap
 
 cgroup_threads:		LDFLAGS += -pthread
+cgroup_criu_set:	LDFLAGS += -pthread
 
 bpf_hash:		LDLIBS += -lbpf
 bpf_array:		LDLIBS += -lbpf

@@ -84,6 +84,7 @@
 #include "dump.h"
 #include "eventpoll.h"
 #include "memfd.h"
+#include "extmem.h"
 #include "timens.h"
 #include "img-streamer.h"
 #include "pidfd-store.h"
@@ -104,9 +105,6 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 {
 	return 0;
 }
-
-#define PERSONALITY_LENGTH 9
-static char loc_buf[PERSONALITY_LENGTH];
 
 void free_mappings(struct vm_area_list *vma_area_list)
 {
@@ -635,27 +633,6 @@ err:
 	return -1;
 }
 
-static int get_task_personality(pid_t pid, u32 *personality)
-{
-	int fd, ret = -1;
-
-	pr_info("Obtaining personality ... \n");
-
-	fd = open_proc(pid, "personality");
-	if (fd < 0)
-		goto err;
-
-	ret = read(fd, loc_buf, sizeof(loc_buf) - 1);
-	close(fd);
-
-	if (ret >= 0) {
-		loc_buf[ret] = '\0';
-		*personality = atoi(loc_buf);
-	}
-err:
-	return ret;
-}
-
 static DECLARE_KCMP_TREE(vm_tree, KCMP_VM);
 static DECLARE_KCMP_TREE(fs_tree, KCMP_FS);
 static DECLARE_KCMP_TREE(files_tree, KCMP_FILES);
@@ -766,6 +743,9 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 		}
 		tc->has_timerslack_ns = true;
 		tc->timerslack_ns = ti->timerslack_ns;
+		tc->personality = ti->personality;
+		tc->has_personality = true;
+		pr_info("%d has personality 0x%x\n", pid, ti->personality);
 		tc->comm = xstrdup(ti->comm);
 		if (tc->comm == NULL)
 			return -1;
@@ -811,9 +791,8 @@ static int dump_task_core_all(struct parasite_ctl *ctl, struct pstree_item *item
 		core->tc->has_membarrier_registration_mask = true;
 	}
 
-	ret = get_task_personality(pid, &core->tc->personality);
-	if (ret < 0)
-		goto err;
+	/* Deprecated; personality is dumped per-thread in dump_thread_core */
+	core->tc->personality = 0;
 
 	__strlcpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
 	core->tc->flags = stat->flags;
@@ -1931,6 +1910,18 @@ static int cr_dump_finish(int ret)
 
 	cgp_fini();
 
+	/*
+	 * Complete the provider's image output before the post-dump
+	 * script runs, so that the script sees a finished checkpoint.
+	 */
+	if (ret) {
+		if (extmem_abort())
+			pr_err("Failed to abort external memory provider session\n");
+	} else if (extmem_commit()) {
+		pr_err("Failed to commit external memory provider session\n");
+		ret = -1;
+	}
+
 	if (!ret) {
 		/*
 		 * It might be a migration case, where we're asked
@@ -1976,8 +1967,17 @@ static int cr_dump_finish(int ret)
 		delete_link_remaps();
 	}
 
-	if (!ret && opts.lazy_pages)
+	/*
+	 * The lazy transfer below only ends once the destination has restored
+	 * and drained the pages, and the destination cannot restore until the
+	 * image stream is closed. Every image is written by now, so dismiss
+	 * the streamer before serving rather than after.
+	 */
+	if (!ret && opts.lazy_pages) {
+		if (opts.stream)
+			img_streamer_finish();
 		ret = cr_lazy_mem_dump();
+	}
 
 	if (arch_set_thread_regs(root_item, true) < 0)
 		return -1;
@@ -2056,6 +2056,10 @@ int cr_dump_tasks(pid_t pid)
 	if (!root_item)
 		goto err;
 	root_item->pid->real = pid;
+
+	ret = extmem_init();
+	if (ret < 0 && ret != -ENOTSUP)
+		goto err;
 
 	ret = run_scripts(ACT_PRE_DUMP);
 	if (ret != 0) {
@@ -2224,6 +2228,7 @@ int cr_dump_tasks(pid_t pid)
 
 	exit_code = write_img_inventory(&he, parent_ie);
 err:
+	free_inventory(&he);
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
 

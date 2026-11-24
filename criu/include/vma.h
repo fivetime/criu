@@ -13,10 +13,7 @@ struct vm_area_list {
 	struct list_head h;   /* list of VMAs */
 	unsigned nr;	      /* nr of all VMAs in the list */
 	unsigned int nr_aios; /* nr of AIOs VMAs in the list */
-	union {
-		unsigned long nr_priv_pages; /* dmp: nr of pages in private VMAs */
-		unsigned long rst_priv_size; /* rst: size of private VMAs */
-	};
+	unsigned long nr_priv_pages; /* dmp: nr of pages in private VMAs */
 	unsigned long nr_priv_pages_longest;   /* nr of pages in longest private VMA */
 	unsigned long nr_shared_pages_longest; /* nr of pages in longest shared VMA */
 };
@@ -56,6 +53,8 @@ struct vma_area {
 			struct vma_area *pvma;	      /* parent for inherited VMAs */
 			unsigned long *page_bitmap;   /* existent pages */
 			unsigned long premmaped_addr; /* restore only */
+			bool should_premap;
+			bool provider_backed; /* restore only */
 
 			/*
 			 * Some notes about pvma, page_bitmap and premmaped_addr bits
@@ -125,6 +124,28 @@ static inline bool vma_entry_can_be_lazy(VmaEntry *e)
 	return ((e->flags & MAP_ANONYMOUS) && (e->flags & MAP_PRIVATE) && !(e->flags & MAP_LOCKED) &&
 		!(vma_entry_is(e, VMA_AREA_VDSO)) && !(vma_entry_is(e, VMA_AREA_VVAR)) &&
 		!(vma_entry_is(e, VMA_AREA_VSYSCALL)) && !(e->flags & MAP_HUGETLB));
+}
+
+/*
+ * Return the THP advice saved for a VMA, or 0 if it has none. The advice
+ * decides the size of the pages a fault allocates, and a page that is already
+ * present keeps its size. Restore applies it before filling the VMA.
+ *
+ * The image does not record which ranges were backed by huge pages. With
+ * MADV_HUGEPAGE applied early, the first page restored into a PMD-sized range
+ * faults in a whole huge page, even if only a few base pages of that range
+ * were present at dump time. The restored task can then use more memory than
+ * the dumped one. This is not handled yet.
+ */
+static inline int vma_entry_thp_advice(VmaEntry *e)
+{
+	if (!e->has_madv)
+		return 0;
+	if (e->madv & (1ul << MADV_HUGEPAGE))
+		return MADV_HUGEPAGE;
+	if (e->madv & (1ul << MADV_NOHUGEPAGE))
+		return MADV_NOHUGEPAGE;
+	return 0;
 }
 
 #endif /* __CR_VMA_H__ */

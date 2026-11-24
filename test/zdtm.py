@@ -28,6 +28,7 @@ from builtins import input, int, open, range, str, zip
 import yaml
 
 from zdtm.criu_config import criu_config
+from zdtm.extmem_provider import ExtmemProvider
 
 # File to store content of streamed images
 STREAMED_IMG_FILE_NAME = "img.criu"
@@ -969,9 +970,10 @@ class criu_cli:
             preload_libfault=False,
             nowait=False,
             timeout=60):
+        # LeakSanitizer does not work under ptrace (strace).
         env = dict(
             os.environ,
-            ASAN_OPTIONS="log_path=asan.log:disable_coredump=0:detect_leaks=0",
+            ASAN_OPTIONS="log_path=asan.log:disable_coredump=0:detect_leaks=%d:fast_unwind_on_malloc=0" % (not strace),
             CRIU_LIBS_DIR=PLUGINS_DIR
         )
 
@@ -1233,6 +1235,7 @@ class criu:
         self.__compress_acceleration = opts.get('compress_acceleration', 0)
         self.__compress_block = opts.get('compress_block', None)
         self.__cuda_checkpoint = bool(opts['mocked_cuda_checkpoint'] or opts['cuda_checkpoint'])
+        self.__extmem_provider = None
 
         if opts['rpc']:
             self.__criu = criu_rpc
@@ -1286,6 +1289,10 @@ class criu:
                                     self.__dump_path)
 
         os.makedirs(self.__dump_path)
+
+    def prepare_extmem_provider(self, image_fallback=False, require_shared=True, vma_fallback=False):
+        self.__extmem_provider = ExtmemProvider(
+            self.__test.getpid(), image_fallback, require_shared, vma_fallback)
 
     def cleanup(self):
         if self.__dump_path:
@@ -1584,8 +1591,10 @@ class criu:
                   (stats_written, r_pages, r_off))
             raise test_fail_exc("page counts mismatch")
 
-    # action can be "capture", "extract", or "serve"
-    def spawn_criu_image_streamer(self, action):
+    # action can be "capture", "extract", or "serve". clients is how many CRIU
+    # processes will read a served image: a lazy restore adds the lazy-pages
+    # daemon alongside the restore itself.
+    def spawn_criu_image_streamer(self, action, clients=1):
         print("Run criu-image-streamer in {} mode".format(action))
 
         progress_r, progress_w = os.pipe()
@@ -1605,8 +1614,10 @@ class criu:
             cmd = ["cat {img_file} |",
                    "criu-image-streamer",
                    "--images-dir '{images_dir}'",
-                   "--progress-fd {progress_fd}",
-                   action]
+                   "--progress-fd {progress_fd}"]
+            if action == 'serve' and clients > 1:
+                cmd.append("--criu-clients %d" % clients)
+            cmd.append(action)
 
         log = open(os.path.join(self.__ddir(), "img-streamer.log"), "w")
 
@@ -1777,8 +1788,9 @@ class criu:
             if ret:
                 raise test_fail_exc("criu page-server exited with %d" % ret)
 
-    def restore(self):
+    def restore(self, use_extmem_provider=False):
         r_opts = []
+        provider = None
         if self.__restore_sibling:
             r_opts = ["--restore-sibling"]
             self.__test.auto_reap = False
@@ -1791,7 +1803,7 @@ class criu:
             r_opts += ['--action-script', os.getcwd() + '/empty-netns-prep.sh']
 
         if self.__stream:
-            self.spawn_criu_image_streamer("serve")
+            self.spawn_criu_image_streamer("serve", clients=2 if self.__lazy_migrate else 1)
             r_opts += ["--stream"]
 
         if self.__dedup:
@@ -1821,6 +1833,8 @@ class criu:
                 self.__page_server_p = self.__criu_act("page-server",
                                                        opts=ps_opts,
                                                        nowait=True)
+            if self.__stream:
+                lp_opts += ["--stream"]
             self.__lazy_pages_p = self.__criu_act("lazy-pages",
                                                   opts=lp_opts,
                                                   nowait=True)
@@ -1832,7 +1846,17 @@ class criu:
         if self.__leave_stopped:
             r_opts += ['--leave-stopped']
 
-        self.__criu_act("restore", opts=r_opts + ["--restore-detached"])
+        if use_extmem_provider:
+            provider = self.__extmem_provider
+            if provider is None:
+                raise test_fail_exc("external memory provider was not prepared")
+            r_opts += provider.start(self.__ddir())
+        try:
+            self.__criu_act("restore", opts=r_opts + ["--restore-detached"])
+        finally:
+            if provider:
+                provider.finish()
+                self.__extmem_provider = None
         if self.__stream:
             ret = self.wait_for_criu_image_streamer()
             if ret:
@@ -1957,6 +1981,14 @@ def cr(cr_api, test, opts):
             cr_api.dump("dump", opts=["--leave-running"])
         else:
             try_run_hook(test, ["--pre-dump"])
+            use_extmem_provider = (opts['extmem_provider'] or
+                                    opts['extmem_provider_image_fallback'] or
+                                    opts['extmem_provider_vma_fallback'])
+            if use_extmem_provider:
+                cr_api.prepare_extmem_provider(
+                    image_fallback=opts['extmem_provider_image_fallback'],
+                    require_shared=not opts['extmem_provider_image_fallback'],
+                    vma_fallback=opts['extmem_provider_vma_fallback'])
             cr_api.dump("dump")
             if not opts['lazy_migrate']:
                 test.gone()
@@ -1964,11 +1996,16 @@ def cr(cr_api, test, opts):
                 test.unlink_pidfile()
             sbs('before restore')
             try_run_hook(test, ["--pre-restore"])
-            cr_api.restore()
+            cr_api.restore(use_extmem_provider)
             os.environ["ZDTM_TEST_PID"] = str(test.getpid())
             os.environ["ZDTM_IMG_DIR"] = cr_api.logs()
             try_run_hook(test, ["--post-restore"])
             sbs('after restore')
+
+            if opts['extmem_provider']:
+                cr_api.dump("dump")
+                test.gone()
+                cr_api.restore()
 
         time.sleep(iters[1])
 
@@ -1976,7 +2013,7 @@ def cr(cr_api, test, opts):
 # Additional checks that can be done outside of test process
 
 
-def get_visible_state(test):
+def get_visible_state(test, opts):
     maps = {}
     files = {}
     mounts = {}
@@ -2002,7 +2039,11 @@ def get_visible_state(test):
 
             f = "/proc/%s/root/proc/%s/map_files/%s" % (test.getpid(), pid,
                                                         mp.split()[0])
-            if os.access(f, os.F_OK):
+            # Provider-backed anonymous VMAs acquire a map_files link.
+            if os.access(f, os.F_OK) and not (
+                (opts['extmem_provider'] or opts['extmem_provider_image_fallback']) and
+                os.readlink(f).startswith('/memfd:zdtm-extmem-private ')
+            ):
                 st = os.lstat(f)
                 m.append(oct(st.st_mode))
 
@@ -2042,7 +2083,7 @@ def has_vsyscall(maps):
 
 
 def check_visible_state(test, state, opts):
-    new = get_visible_state(test)
+    new = get_visible_state(test, opts)
 
     for pid in state[0].keys():
         fnew = new[0][pid]
@@ -2296,7 +2337,7 @@ def do_run_test(tname, tdesc, flavs, opts):
 
         try:
             t.start()
-            s = get_visible_state(t)
+            s = get_visible_state(t, opts)
             try:
                 cr(cr_api, t, opts)
             except test_fail_expected_exc as e:
@@ -2439,6 +2480,8 @@ class Launcher:
               'sat', 'script', 'rpc', 'criu_config', 'lazy_pages', 'join_ns',
               'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup',
               'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'stream',
+              'extmem_provider', 'extmem_provider_image_fallback',
+              'extmem_provider_vma_fallback',
               'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'image_io_mode', 'mntns_compat_mode',
               'rootless', 'preload_libfault', 'mocked_cuda_checkpoint', 'cuda_checkpoint',
               'compress', 'compress_acceleration', 'compress_block',
@@ -2655,7 +2698,7 @@ def print_error(line):
 # are silently skipped and will not trigger "ERROR OVER" output.
 grep_errors_ignore = [
     # Commonly seen with ns/uns flavors; harmless but triggers ERROR OVER
-    r"Error: ipv[46]: [Aa]ddress already assigned\.",  # codespell:ignore ddress
+    r"Error: ipv[46]: (?i:address) already assigned\.",
 ]
 
 
@@ -2701,6 +2744,10 @@ def grep_errors(fname, err=False):
 def run_tests(opts):
     excl = None
     features = {}
+
+    if opts['stream'] and (opts['lazy_pages'] or opts['remote_lazy_pages']):
+        print('--stream supports --lazy-migrate only')
+        sys.exit(1)
 
     if opts['pre'] or opts['snaps']:
         if not criu.check("mem_dirty_track"):
@@ -3111,6 +3158,15 @@ def get_cli_args():
                     action='store_true')
     rp.add_argument("--stream",
                     help="Use criu-image-streamer",
+                    action='store_true')
+    rp.add_argument("--extmem-provider",
+                    help="Restore with the test external-memory provider, then without it",
+                    action='store_true')
+    rp.add_argument("--extmem-provider-image-fallback",
+                    help="Restore with the test provider declining one image",
+                    action='store_true')
+    rp.add_argument("--extmem-provider-vma-fallback",
+                    help="Restore with the test provider declining private VMAs",
                     action='store_true')
     rp.add_argument("-p", "--parallel", help="Run test in parallel")
     rp.add_argument("--dry-run",
